@@ -1,0 +1,1093 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Claude Code 记忆机制：按类别拆解与完整会话生命周期</title>
+<style>
+:root{
+  --bg:#f6f8fc;--panel:#fff;--text:#202431;--muted:#667085;--line:#e2e6ef;
+  --accent:#5b5bd6;--accentSoft:#f0f0ff;--good:#067647;--goodBg:#ecfdf3;
+  --warn:#93370d;--warnBg:#fffaeb;--bad:#b42318;--badBg:#fef3f2;
+  --code:#121722;--codeText:#eef2f7;
+}
+@media(prefers-color-scheme:dark){
+:root{--bg:#10131a;--panel:#181c25;--text:#edf1f7;--muted:#aab2c0;--line:#303746;
+--accent:#aaa2ff;--accentSoft:#26233d;--good:#75e0a7;--goodBg:#102a21;
+--warn:#fec84b;--warnBg:#33270f;--bad:#f97066;--badBg:#351817;--code:#0b0e14;--codeText:#e7eaf0}
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.75 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.layout{width:min(1540px,100%);margin:auto;display:grid;grid-template-columns:320px minmax(0,1000px);gap:30px;padding:28px 32px 54px;justify-content:center;align-items:start}
+aside{position:sticky;top:20px;height:calc(100vh - 40px);overflow:auto;padding:18px 16px 22px;background:var(--panel);border:1px solid var(--line);border-radius:14px}
+aside strong{display:block;margin-bottom:10px;padding:0 8px 10px;border-bottom:1px solid var(--line)}
+#toc{display:flex;flex-direction:column;gap:2px}
+#toc a{display:block;color:var(--muted);text-decoration:none;padding:6px 9px;border-left:3px solid transparent;border-radius:6px;font-size:13.5px;line-height:1.42}
+#toc a.sub{padding-left:22px;font-size:13px}#toc a.sub3{padding-left:34px;font-size:12.3px}
+#toc a:hover,#toc a.active{color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent)}
+#toc a.active{border-left-color:var(--accent);font-weight:650}
+article{min-width:0;padding:42px 52px;background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:0 12px 38px rgba(20,25,40,.06)}
+h1,h2,h3,h4{line-height:1.3;scroll-margin-top:24px}
+h1{margin:1.85em 0 .65em;font-size:2.12rem;border-bottom:1px solid var(--line);padding-bottom:.35em}
+article>h1:first-of-type{margin-top:.25em;font-size:2.48rem}
+h2{margin:1.7em 0 .55em;font-size:1.52rem}
+h3{margin:1.4em 0 .45em;font-size:1.16rem;color:var(--accent)}
+h4{font-size:1.02rem}
+blockquote{margin:1.2em 0;padding:.85em 1.15em;border-left:4px solid var(--accent);background:color-mix(in srgb,var(--accent) 7%,transparent);color:var(--muted)}
+code{font-family:"Cascadia Code","SFMono-Regular",Consolas,monospace;font-size:.92em;background:color-mix(in srgb,var(--accent) 9%,transparent);padding:.12em .35em;border-radius:4px}
+pre{overflow:auto;padding:18px 20px;border-radius:10px;background:var(--code);color:var(--codeText);line-height:1.52}
+pre code{padding:0;background:none;color:inherit}
+table{width:100%;border-collapse:collapse;margin:1.3em 0;display:block;overflow:auto}
+th,td{border:1px solid var(--line);padding:9px 12px;text-align:left;vertical-align:top}
+th{background:color-mix(in srgb,var(--accent) 9%,transparent)}
+.callout{padding:14px 16px;border-radius:10px;margin:16px 0;border:1px solid}
+.note{background:var(--accentSoft);border-color:color-mix(in srgb,var(--accent) 30%,var(--line))}
+.good{background:var(--goodBg);border-color:color-mix(in srgb,var(--good) 35%,var(--line))}
+.warn{background:var(--warnBg);border-color:color-mix(in srgb,var(--warn) 35%,var(--line))}
+.bad{background:var(--badBg);border-color:color-mix(in srgb,var(--bad) 35%,var(--line))}
+.kicker{font-size:.8rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:700}
+.muted{color:var(--muted)}
+a{color:var(--accent)}
+.tag{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 8px;font-size:.82rem;color:var(--muted);margin:0 4px 4px 0}
+@media(max-width:980px){.layout{display:block;padding:14px}aside{position:relative;top:auto;height:auto;max-height:42vh;margin-bottom:14px}article{padding:26px 22px}article>h1:first-of-type{font-size:2rem}}
+@media print{body{background:white}.layout{display:block;padding:0}.layout aside{display:none}article{border:0;box-shadow:none;padding:0}pre{white-space:pre-wrap}}
+</style>
+</head>
+<body>
+<div class="layout">
+<aside><strong>目录</strong><nav id="toc"></nav></aside>
+<article>
+
+<div class="kicker">BennettBin/Claude-code · Category-first Memory Architecture</div>
+<h1>Claude Code 的记忆机制：按记忆类别拆解，并追踪一次完整会话的存储与调用</h1>
+
+<blockquote>
+<p><strong>这版先按“记忆是什么”来拆，而不是按源码目录来拆。</strong>Claude Code 的记忆可以分成 6 类：①运行时工作记忆；②静态指令记忆；③会话摘要记忆；④跨会话长期记忆；⑤作用域专属记忆（Agent/Team）；⑥恢复性记忆（Transcript/FileHistory）。其中只有第④类最接近通常所说的“长期语义记忆”；第⑥类负责恢复，不负责语义召回。一次真实会话会同时使用其中多类，而不是只访问一个 Memory Store。</p>
+</blockquote>
+
+<div class="warn callout">
+<strong>源码边界：</strong>本文基于 <a href="https://github.com/BennettBin/Claude-code">BennettBin/Claude-code</a> 恢复源码。仓库 README 自身说明：这是从公开发布物 source map 恢复出的 TypeScript 源码树，版本标记为 <code>999.0.0-restored</code>，不是 Anthropic 官方开发仓库。文中凡涉及 Feature Gate、Remote Config、Team Memory、AutoDream 等条件能力，都按“源码中存在且满足 gate 时启用”描述。
+</div>
+
+<h1>一、先看全景：6 类记忆分别解决什么问题？</h1>
+
+<table>
+<thead>
+<tr>
+<th>类别</th><th>核心问题</th><th>主要存储</th><th>生命周期</th><th>主要读取时机</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>A. 运行时工作记忆</strong></td>
+<td>“这一轮/这个会话已经发生了什么？”</td>
+<td>RAM：<code>QueryEngine.mutableMessages</code>、<code>readFileState</code>、<code>ToolUseContext</code></td>
+<td>当前进程/Conversation</td>
+<td>每次 queryLoop / Tool 调用</td>
+</tr>
+<tr>
+<td><strong>B. 静态指令记忆</strong></td>
+<td>“Claude 在这个用户/项目/目录里应该遵守什么？”</td>
+<td><code>CLAUDE.md</code>、rules、local memory</td>
+<td>长期文件</td>
+<td>Session 启动 + 进入嵌套目录时</td>
+</tr>
+<tr>
+<td><strong>C. 会话摘要记忆</strong></td>
+<td>“长任务现在做到哪里，Compact 后如何继续？”</td>
+<td>SessionMemory Markdown notes</td>
+<td>当前 Session</td>
+<td>长会话中后台更新；Compact 时使用</td>
+</tr>
+<tr>
+<td><strong>D. 跨会话长期记忆</strong></td>
+<td>“以后还值得记住什么？”</td>
+<td><code>MEMORY.md</code> + topic <code>.md</code></td>
+<td>跨 Session</td>
+<td>每次新会话入口加载 + 每轮按需召回</td>
+</tr>
+<tr>
+<td><strong>E. 作用域专属记忆</strong></td>
+<td>“哪些经验只属于某类 Agent 或某个团队？”</td>
+<td>Agent Memory / Team Memory 目录</td>
+<td>跨 Session，按 scope</td>
+<td>Agent 启动 / Team Memory 注入与召回</td>
+</tr>
+<tr>
+<td><strong>F. 恢复性记忆</strong></td>
+<td>“进程退出后，怎样恢复到此前会话/代码状态？”</td>
+<td>Transcript JSONL、Compact metadata、FileHistory</td>
+<td>Session durable</td>
+<td><code>/resume</code>、rewind、故障恢复</td>
+</tr>
+</tbody>
+</table>
+
+<div class="note callout">
+<strong>最重要的区分：</strong>
+<br>Auto Memory 解决“跨会话语义记忆”；
+<br>SessionMemory 解决“当前长会话摘要”；
+<br>Transcript 解决“会话事件恢复”；
+<br>CLAUDE.md 解决“人工确定的长期规则”。
+<br>四者绝不是同一种 Memory。
+</div>
+
+<h1>二、A 类：运行时工作记忆（Working Memory）</h1>
+
+<h2>2.1 核心载体是 <code>QueryEngine</code></h2>
+<p>恢复源码中的 <code>src/QueryEngine.ts</code> 明确把 QueryEngine 设计成一个 Conversation 级对象。它不是“一次 API 请求一个对象”，而是在同一会话里跨多次 <code>submitMessage()</code> 保留状态。</p>
+
+<pre><code>QueryEngine
+├─ mutableMessages
+├─ readFileState
+├─ totalUsage
+├─ permissionDenials
+├─ abortController
+├─ discoveredSkillNames
+└─ loadedNestedMemoryPaths
+</code></pre>
+
+<h2>2.2 <code>mutableMessages</code> 是短期记忆主体</h2>
+<p>它保存当前模型下一次请求需要看到的消息链，包括：</p>
+
+<pre><code>User
+Assistant
+Tool Result
+System / Attachment
+Compact Boundary 后仍保留的 active messages
+</code></pre>
+
+<p>典型 ReAct 循环：</p>
+
+<pre><code>User: 修复 bug
+    ↓
+mutableMessages += User
+    ↓
+Claude → tool_use Read
+    ↓
+Read result
+    ↓
+mutableMessages += tool_result
+    ↓
+Claude → tool_use Edit
+    ↓
+Edit result
+    ↓
+mutableMessages += tool_result
+    ↓
+Claude final
+</code></pre>
+
+<p>这里的 Tool Result 就是 Observation，也是下一次模型推理的工作记忆。</p>
+
+<h2>2.3 <code>readFileState</code> 是“对文件世界的认知记忆”</h2>
+<p>Claude Code 不只需要知道“对话里提过某文件”，还需要知道 Agent 最近实际读取过哪些文件状态。这个状态用于避免 Edit 建立在未知或过期内容上。</p>
+
+<pre><code>Read(foo.ts)
+    ↓
+readFileState 记录观察状态
+    ↓
+Edit(foo.ts)
+    ↓
+Runtime 判断该 Edit 是否建立在有效读取上
+</code></pre>
+
+<h2>2.4 <code>loadedNestedMemoryPaths</code> 是 Session 级去重记忆</h2>
+<p>当 Tool 进入某个更深目录时，可能发现局部 <code>CLAUDE.md</code>。该文件被作为 <code>nested_memory</code> attachment 注入后，路径会加入 <code>loadedNestedMemoryPaths</code>。这个 Set 跨 Turn 保留，用来防止同一局部指令反复注入。</p>
+
+<pre><code>Read src/service/foo.ts
+    ↓
+发现 src/service/CLAUDE.md
+    ↓
+注入 nested_memory
+    ↓
+loadedNestedMemoryPaths.add(path)
+    ↓
+后续 Turn 再访问该目录
+    ↓
+不重复注入
+</code></pre>
+
+<h2>2.5 运行时工作记忆什么时候消失？</h2>
+<p>进程结束后 RAM 状态消失。因此它如果要被恢复，必须依靠 F 类“恢复性记忆”中的 Transcript / FileHistory 等 Durable State 重新水合。</p>
+
+<h1>三、B 类：静态指令记忆（CLAUDE.md / Rules）</h1>
+
+<h2>3.1 它存的不是“对话经验”，而是稳定规则</h2>
+<p><code>src/utils/claudemd.ts</code> 所体现的是人工维护的 Instructions Memory。典型内容：</p>
+
+<ul>
+<li>编码规范。</li>
+<li>架构边界。</li>
+<li>测试命令。</li>
+<li>禁止事项。</li>
+<li>某目录特殊约束。</li>
+</ul>
+
+<h2>3.2 主要作用域</h2>
+
+<table>
+<tr><th>作用域</th><th>语义</th></tr>
+<tr><td>Managed</td><td>企业管理员强制规则。</td></tr>
+<tr><td>User</td><td>用户跨项目通用规则。</td></tr>
+<tr><td>Project</td><td>项目共享规则，如项目根或 <code>.claude/</code> 下的 CLAUDE.md/rules。</td></tr>
+<tr><td>Local</td><td>只对当前机器/本地工作区有效、不一定进入版本控制的规则。</td></tr>
+</table>
+
+<h2>3.3 两种加载模式</h2>
+
+<h3>启动时：Eager load</h3>
+<pre><code>Session start
+    ↓
+发现 managed/user/project/local CLAUDE.md
+    ↓
+加入 Context Construction
+</code></pre>
+
+<h3>运行中：Lazy nested load</h3>
+<pre><code>Agent 进入更深目录
+    ↓
+发现该目录局部 CLAUDE.md
+    ↓
+nested_memory attachment
+    ↓
+记录 loadedNestedMemoryPaths
+</code></pre>
+
+<h2>3.4 为什么它不属于 Auto Memory？</h2>
+<p>因为 CLAUDE.md 代表<strong>用户/组织明确声明的规范</strong>。它不应该被后台总结 Agent 自动改写或和概率性的“学到的偏好”混在一起。</p>
+
+<h1>四、C 类：会话摘要记忆（SessionMemory）</h1>
+
+<h2>4.1 目标：保持“继续工作的能力”</h2>
+<p><code>src/services/SessionMemory/</code> 维护的是当前长会话的结构化笔记，不是跨会话用户画像。</p>
+
+<pre><code>SessionMemory
+≈ Current Task Continuation Brief
+</code></pre>
+
+<p>典型模板包含：</p>
+
+<ul>
+<li>Session Title</li>
+<li>Current State</li>
+<li>Task Specification</li>
+<li>Files and Functions</li>
+<li>Workflow</li>
+<li>Errors &amp; Corrections</li>
+<li>Codebase/System Documentation</li>
+<li>Learnings</li>
+<li>Key Results</li>
+<li>Worklog</li>
+</ul>
+
+<h2>4.2 什么时候开始维护？</h2>
+<p>恢复源码中的默认阈值是：</p>
+
+<pre><code>首次初始化：
+minimumMessageTokensToInit ≈ 10,000 tokens
+
+后续更新：
+minimumTokensBetweenUpdate ≈ 5,000 tokens
+
+并通常要求：
+toolCallsBetweenUpdates ≈ 3
+</code></pre>
+
+<p>如果 Token 已达到更新阈值且当前出现自然停顿（最后一轮没有工具调用），也可以更新，而不必机械等到 3 个 Tool Call。</p>
+
+<h2>4.3 谁来写？</h2>
+<p>不是主 Agent 一边正常工作一边自己总结，而是：</p>
+
+<pre><code>Main Agent messages
+    ↓
+SessionMemory trigger
+    ↓
+runForkedAgent()
+    ↓
+专用 SessionMemory 子 Agent
+    ↓
+只允许修改对应 Session Memory file
+</code></pre>
+
+<p>这个后台 Agent 权限非常窄，主要只允许 Edit 那个会话笔记文件，避免一个“总结任务”拥有修改代码或执行 Bash 的能力。</p>
+
+<h2>4.4 为什么它和 Compact 紧密绑定？</h2>
+<p>当 Context Window 变长时，Runtime 不需要临时重新读取全对话再做昂贵总结，而可以复用已经持续维护的 SessionMemory。</p>
+
+<pre><code>长会话持续运行
+    ↓
+后台 SessionMemory 已不断维护
+    ↓
+Context 接近阈值
+    ↓
+sessionMemoryCompact
+    ↓
+把高密度 Session Notes 作为 Compact 基础
+</code></pre>
+
+<p>所以 SessionMemory 更接近“会话级滚动摘要缓存”。</p>
+
+<h1>五、D 类：跨会话长期记忆（Auto Memory）</h1>
+
+<h2>5.1 这是最接近通常意义上的 Long-Term Memory</h2>
+<p>核心目录是 <code>src/memdir/</code>。默认物理布局大致：</p>
+
+<pre><code>~/.claude/
+└─ projects/
+   └─ &lt;sanitized-canonical-git-root&gt;/
+      └─ memory/
+         ├─ MEMORY.md
+         ├─ user_role.md
+         ├─ feedback_testing.md
+         ├─ project_release.md
+         └─ reference_dashboard.md
+</code></pre>
+
+<p>源码使用 canonical Git root 作为项目 identity，因此同一 repository 的多个 worktree 可以共享同一 Auto Memory。</p>
+
+<h2>5.2 <code>MEMORY.md</code> 是索引，不是完整正文</h2>
+
+<pre><code>MEMORY.md
+    ↓
+简短入口 / pointers
+
+topic files
+    ↓
+详细长期记忆正文
+</code></pre>
+
+<p>源码限制入口文件大致为：</p>
+
+<pre><code>MAX_ENTRYPOINT_LINES = 200
+MAX_ENTRYPOINT_BYTES = 25,000
+</code></pre>
+
+<p>设计目的是让每次 Session 启动时可以加载一个小而稳定的长期记忆入口，而不是每轮把整个长期记忆目录塞进 Context。</p>
+
+<h2>5.3 长期记忆内部再分 4 个语义类别</h2>
+
+<table>
+<tr><th>类型</th><th>应该保存什么</th><th>例子</th></tr>
+<tr><td><code>user</code></td><td>用户角色、目标、长期偏好、专业背景。</td><td>“用户希望解释偏工程化而不是产品宣传。”</td></tr>
+<tr><td><code>feedback</code></td><td>用户对 Claude 工作方式的纠正、确认和方法偏好。</td><td>“测试不能使用 DB mock。”</td></tr>
+<tr><td><code>project</code></td><td>无法仅从代码重新推导的重要项目事实/决策。</td><td>“下一版本必须保持 API backward-compatible。”</td></tr>
+<tr><td><code>reference</code></td><td>外部资源的稳定定位信息。</td><td>“生产监控入口在哪里。”</td></tr>
+</table>
+
+<h2>5.4 什么不应该存进长期记忆？</h2>
+<p>Memory Extraction Prompt 刻意排除：</p>
+
+<ul>
+<li>当前代码直接能重新读取出来的普通事实。</li>
+<li>Git 历史本身已有的信息。</li>
+<li>一次性 Debug 中间过程。</li>
+<li>短暂任务状态。</li>
+<li>CLAUDE.md 已经明确记录的规则。</li>
+</ul>
+
+<p>基本原则是：</p>
+
+<blockquote>只保存“未来仍有价值，而且无法低成本从当前世界重新推导”的信息。</blockquote>
+
+<h1>六、D 类记忆怎么召回：不是 Vector DB，而是两阶段选择</h1>
+
+<h2>6.1 第一阶段：廉价 Manifest Scan</h2>
+<p><code>memoryScan.ts</code> 会扫描 topic markdown，而不是直接读取所有全文。</p>
+
+<pre><code>memory/*.md
+    ↓
+最多扫描约 200 个文件
+    ↓
+只读取 Frontmatter / Header
+    ↓
+filename
+name
+description
+type
+mtime
+</code></pre>
+
+<p>Frontmatter 只需承担“可检索摘要”的职责。</p>
+
+<h2>6.2 第二阶段：Side Query 语义选择</h2>
+
+<pre><code>当前用户请求
++
+Memory manifest
++
+recent tools / already surfaced
+    ↓
+findRelevantMemories()
+    ↓
+Side Query（恢复源码中使用 Sonnet 级 selector）
+    ↓
+选择最多少量相关 topic files（典型最多 5）
+    ↓
+读取正文
+    ↓
+relevant_memories attachment
+    ↓
+Main Agent Context
+</code></pre>
+
+<h2>6.3 为什么不用 embedding/vector DB？</h2>
+<p>这套实现的工程取舍是：</p>
+
+<ul>
+<li>文件可读、可编辑、可备份。</li>
+<li>不需要 embedding index lifecycle。</li>
+<li>小型 manifest 足够便宜。</li>
+<li>LLM selector 可以直接理解 description 和当前任务。</li>
+</ul>
+
+<h2>6.4 已经召回过的文件不会反复占槽位</h2>
+<p><code>alreadySurfaced</code> 会在 Session 内去重。否则一个总是相关的 topic file 可能每轮都重复占用有限的相关记忆槽位。</p>
+
+<h2>6.5 Memory 有 Freshness，不被当成实时事实</h2>
+<p><code>memoryAge.ts</code> 会基于修改时间生成 stale warning。长期记忆中的 file path、line number、代码行为都可能过期，因此模型会被提醒重新验证当前代码。</p>
+
+<h1>七、D 类记忆怎么写入：主 Agent + 后台 Extractor + AutoDream</h1>
+
+<h2>7.1 主 Agent 可以主动保存</h2>
+<p>当用户明确要求记住，或模型根据 Memory Prompt 判断某条信息非常值得长期保留时，可以直接维护 topic file 和 <code>MEMORY.md</code>。</p>
+
+<h2>7.2 后台 <code>extractMemories</code> 是“忘记保存”的兜底</h2>
+
+<pre><code>完整 Query Loop 结束
+模型已经给出最终回答
+且没有后续 tool_use
+    ↓
+Stop Hooks
+    ↓
+extractMemories
+    ↓
+Forked Agent
+    ↓
+只分析尚未处理的新消息区间
+    ↓
+必要时写 Auto Memory
+</code></pre>
+
+<p>提取 Agent 权限遵循最小权限：</p>
+
+<table>
+<tr><th>Tool</th><th>权限</th></tr>
+<tr><td>Read / Grep / Glob</td><td>允许读取。</td></tr>
+<tr><td>只读 Bash</td><td>有限允许。</td></tr>
+<tr><td>Edit / Write</td><td>只允许 Auto Memory 目录。</td></tr>
+<tr><td>其他高风险 Tool</td><td>拒绝。</td></tr>
+</table>
+
+<h2>7.3 如果主 Agent 已经写了 Memory，Extractor 会跳过</h2>
+<p>源码通过类似 <code>hasMemoryWritesSince()</code> 的逻辑避免：</p>
+
+<pre><code>Main Agent 写 memory
+        +
+Background Extractor 又写同一内容
+        ↓
+重复 / 冲突
+</code></pre>
+
+<h2>7.4 AutoDream 是低频 Consolidation</h2>
+<p>长期运行后记忆目录可能出现重复、冲突、过时内容。AutoDream 的作用更像：</p>
+
+<pre><code>多个 Session 的增量记忆
+    ↓
+低频后台整理
+    ↓
+merge
+dedupe
+remove stale/conflict
+rewrite index
+</code></pre>
+
+<p>因此：</p>
+
+<pre><code>extractMemories = 记笔记
+autoDream       = 整理笔记本
+</code></pre>
+
+<h1>八、E 类：作用域专属记忆（Agent Memory / Team Memory）</h1>
+
+<h2>8.1 Agent Memory：每类 Agent 自己的经验</h2>
+<p><code>src/tools/AgentTool/agentMemory.ts</code> 把 Agent Memory 分为：</p>
+
+<table>
+<tr><th>Scope</th><th>典型路径</th><th>作用</th></tr>
+<tr><td><code>user</code></td><td><code>~/.claude/agent-memory/&lt;agent-type&gt;/</code></td><td>某 Agent 类型跨项目经验。</td></tr>
+<tr><td><code>project</code></td><td><code>.claude/agent-memory/&lt;agent-type&gt;/</code></td><td>该 Agent 在项目里的共享经验。</td></tr>
+<tr><td><code>local</code></td><td><code>.claude/agent-memory-local/&lt;agent-type&gt;/</code></td><td>只对本机环境有效的经验。</td></tr>
+</table>
+
+<p>例如 Explore Agent 的代码导航经验，没有必要写进用户主 Auto Memory。</p>
+
+<h2>8.2 Team Memory：团队共享知识空间</h2>
+<p>Team Memory 与私人 Auto Memory 分开，并有独立同步逻辑。源码中此能力受 Feature Gate/配置控制，所以它是条件能力。</p>
+
+<pre><code>Private Auto Memory
+    ↓
+用户私有经验
+
+Team Memory
+    ↓
+可以跨团队成员同步的项目级知识
+</code></pre>
+
+<p>这样避免把私人偏好与组织共享规则混为一体。</p>
+
+<h1>九、F 类：恢复性记忆（Transcript / Compact / FileHistory）</h1>
+
+<h2>9.1 Transcript 不是语义长期记忆</h2>
+<p>它解决的是：</p>
+
+<pre><code>“这个 Session 到底发生了什么？”
+</code></pre>
+
+<p>而不是：</p>
+
+<pre><code>“未来哪些经验应该被召回？”
+</code></pre>
+
+<h2>9.2 Transcript 是 JSONL 式 durable event log</h2>
+<p>运行时会持续记录 User、Assistant、Tool interaction、System/Attachment、Compact metadata 等。一个关键可靠性设计是：</p>
+
+<pre><code>User submit
+    ↓
+mutableMessages.push()
+    ↓
+recordTranscript()
+    ↓
+再调用 Claude API
+</code></pre>
+
+<p>即用户请求先落盘，再进入模型调用，避免 API 首个响应前进程退出导致刚提交的用户请求丢失。</p>
+
+<h2>9.3 Compact Boundary 连接“RAM Working Memory”和“Durable History”</h2>
+
+<pre><code>Compact 前：
+RAM = 大量历史消息
+Disk = 完整 transcript
+
+Compact 后：
+RAM = summary / boundary 后 active messages
+Disk = 旧历史 + compact metadata + 新历史
+</code></pre>
+
+<p>所以 Compact 可以释放 RAM/Context，但不意味着过去的 Session durable history 被抹掉。</p>
+
+<h2>9.4 FileHistory 负责恢复 World State</h2>
+<p>仅恢复 Conversation 不够：</p>
+
+<pre><code>对话恢复到 T1
+但磁盘还停留在 T5
+    ↓
+Agent Cognitive State ≠ Workspace State
+</code></pre>
+
+<p>FileHistory / snapshot 机制让 rewind/恢复可以同时协调文件状态。</p>
+
+<h2>9.5 <code>conversationRecovery.ts</code> 负责 Runtime Rehydration</h2>
+
+<pre><code>Transcript
+    ↓
+loadConversationForResume()
+    ↓
+重建合法消息链
+    ↓
+处理未完成 tool_use / orphan thinking
+    ↓
+恢复 Skill state
+    ↓
+复制/恢复 FileHistory
+    ↓
+initialMessages
+    ↓
+新的 QueryEngine
+</code></pre>
+
+<p>这说明 Claude Code 恢复的是<strong>durable facts</strong>，而不是序列化整个 QueryEngine 对象。</p>
+
+<h1>十、现在把 6 类记忆串起来：一次完整会话发生了什么？</h1>
+
+<h2>阶段 0：新会话启动——先装入“长期背景”</h2>
+
+<p>假设用户进入一个 Git 项目后启动 Claude Code。</p>
+
+<pre><code>Claude Code startup
+    ↓
+识别 cwd / project / canonical git root
+    ↓
+加载 B 类静态指令记忆
+    ├─ Managed CLAUDE.md
+    ├─ User CLAUDE.md
+    ├─ Project CLAUDE.md / rules
+    └─ Local rules
+    ↓
+定位 D 类 Auto Memory directory
+    ↓
+读取 MEMORY.md 入口索引
+    ↓
+创建 QueryEngine
+    ↓
+A 类 Working Memory 初始为空/由恢复消息初始化
+</code></pre>
+
+<p>此时模型还没有看到全部 topic memory 正文；它只拥有稳定入口和其它基础 Context。</p>
+
+<h2>阶段 1：用户提交第一条请求</h2>
+
+<p>用户输入：</p>
+
+<pre><code>“帮我运行测试并修复失败项。”
+</code></pre>
+
+<p>发生：</p>
+
+<pre><code>processUserInput()
+    ↓
+User Message
+    ↓
+A 类：
+mutableMessages += user
+    ↓
+F 类：
+recordTranscript(user)
+    ↓
+D 类：
+启动 relevant-memory selection / prefetch
+    ↓
+Context Construction
+    ├─ CLAUDE.md
+    ├─ MEMORY.md
+    ├─ relevant topic memories（若匹配）
+    └─ current messages
+    ↓
+Claude API
+</code></pre>
+
+<h2>阶段 2：长期记忆按当前请求进行“选择性召回”</h2>
+
+<p>假设长期记忆目录里已有：</p>
+
+<pre><code>feedback_testing.md
+description:
+“Project tests must use pnpm test; npm test is unsupported.”
+</code></pre>
+
+<p>Recall 流程：</p>
+
+<pre><code>User query: “运行测试”
+    ↓
+scan memory headers
+    ↓
+build manifest
+    ↓
+sideQuery selector
+    ↓
+选中 feedback_testing.md
+    ↓
+读取正文
+    ↓
+relevant_memories attachment
+    ↓
+Claude 得知应该使用 pnpm test
+</code></pre>
+
+<p>这就是跨会话长期记忆真正“调用”的时刻。</p>
+
+<h2>阶段 3：Claude 开始 Tool Loop——工作记忆不断增长</h2>
+
+<pre><code>Claude
+  → Bash("pnpm test")
+        ↓
+Tool Result
+        ↓
+A 类：
+mutableMessages += observation
+        ↓
+F 类：
+Transcript += tool interaction
+        ↓
+Claude
+  → Read("src/foo.ts")
+        ↓
+readFileState 更新
+        ↓
+如果进入新子目录并发现 CLAUDE.md
+        ↓
+B 类 nested instruction memory 注入
+        ↓
+loadedNestedMemoryPaths 去重
+</code></pre>
+
+<p>这一阶段主要依赖 A 类 Working Memory，B/D 类只在需要时提供稳定背景。</p>
+
+<h2>阶段 4：会话越来越长——SessionMemory 开始维护 continuation brief</h2>
+
+<p>当上下文达到大约 10K Token 以上，并满足后续更新阈值：</p>
+
+<pre><code>A 类完整消息历史
+    ↓
+SessionMemory trigger
+    ↓
+Forked summary agent
+    ↓
+C 类 SessionMemory file
+    ↓
+记录：
+Current State
+Files
+Workflow
+Errors
+Learnings
+Worklog
+</code></pre>
+
+<p>之后每增长一段有效上下文再增量更新，而不是每轮重新生成整份摘要。</p>
+
+<h2>阶段 5：Context Window 压力增大——分层 Compact</h2>
+
+<pre><code>Context growing
+    ↓
+优先 Microcompact
+    ├─ 清理旧的大 Tool Result
+    ↓
+仍接近阈值
+    ↓
+SessionMemory Compact
+    ├─ 利用 C 类滚动工作简报
+    ↓
+必要时 Full/Reactive Compact
+    ↓
+生成 compact boundary / summary
+    ↓
+A 类 RAM 工作记忆缩小
+F 类 Transcript 保留 durable boundary/history
+</code></pre>
+
+<p>这里发生的不是“遗忘全部过去”，而是：</p>
+
+<pre><code>高成本原始细节
+    → 移出 Active Context
+
+高价值任务状态
+    → 通过 SessionMemory / Summary 继续保留
+</code></pre>
+
+<h2>阶段 6：一轮完整任务结束——把“值得以后记住的东西”写入长期记忆</h2>
+
+<p>假设在本次对话中用户明确纠正：</p>
+
+<pre><code>“以后这个项目不要用 npm test，只能用 pnpm test。”
+</code></pre>
+
+<p>这一信息先进入：</p>
+
+<pre><code>A 类 mutableMessages
+F 类 Transcript
+C 类 SessionMemory（若已启用）
+</code></pre>
+
+<p>当完整 Query Loop 结束：</p>
+
+<pre><code>Final assistant response
+    ↓
+Stop Hooks
+    ↓
+检查主 Agent 是否已经主动写 Auto Memory
+    ├─ 已写 → extractor 跳过该区间
+    └─ 未写
+         ↓
+      extractMemories
+         ↓
+      Forked memory agent
+         ↓
+      判断它属于 feedback
+         ↓
+      写：
+      feedback_testing.md
+         ↓
+      更新 MEMORY.md index
+</code></pre>
+
+<p>这一步才真正把一个“本会话出现的信息”转化成“下次会话可召回的长期记忆”。</p>
+
+<h2>阶段 7：Session 结束——哪些东西留下，哪些消失？</h2>
+
+<table>
+<tr><th>内容</th><th>退出后</th></tr>
+<tr><td><code>mutableMessages</code> / ToolUseContext</td><td>RAM 消失。</td></tr>
+<tr><td>CLAUDE.md</td><td>文件继续存在。</td></tr>
+<tr><td>SessionMemory file</td><td>对应 Session 的笔记文件继续存在，供该会话生命周期/Compact 机制使用。</td></tr>
+<tr><td>Auto Memory</td><td>长期存在，下次项目会话继续使用。</td></tr>
+<tr><td>Agent/Team Memory</td><td>按其 scope 长期存在。</td></tr>
+<tr><td>Transcript/FileHistory</td><td>继续作为该 Session 的恢复材料。</td></tr>
+</table>
+
+<h2>阶段 8A：用户 Resume 同一个 Session</h2>
+
+<pre><code>/resume
+    ↓
+F 类 Transcript
+    ↓
+session discovery
+    ↓
+loadConversationForResume()
+    ↓
+repair protocol invariants
+    ├─ unresolved tool use
+    ├─ orphan thinking
+    └─ compact-related state
+    ↓
+restore invoked skill state
+    ↓
+copy / restore FileHistory
+    ↓
+构造 initialMessages
+    ↓
+新的 QueryEngine
+    ↓
+A 类 Working Memory 被重新水合
+</code></pre>
+
+<p>与此同时，项目的 CLAUDE.md 与 Auto Memory 仍属于当前 Runtime 的长期背景来源。Resume 的核心区别在于：Transcript 负责恢复“这个 Session 发生过什么”。</p>
+
+<h2>阶段 8B：用户不是 Resume，而是第二天开一个全新 Session</h2>
+
+<p>这才是真正检验 D 类长期记忆是否生效的场景：</p>
+
+<pre><code>New session
+    ↓
+同一 canonical git root
+    ↓
+定位同一 Auto Memory directory
+    ↓
+加载 MEMORY.md
+    ↓
+用户：
+“帮我运行测试”
+    ↓
+memory manifest + sideQuery
+    ↓
+再次召回 feedback_testing.md
+    ↓
+Claude:
+使用 pnpm test，而不是 npm test
+</code></pre>
+
+<p>这里完全不需要恢复昨天的整份 Transcript；模型只需要召回对今天任务有价值的 durable memory。</p>
+
+<h1>十一、一个最完整的“信息流转示例”</h1>
+
+<p>信息：</p>
+<pre><code>“这个项目只能使用 pnpm test，不能 npm test。”
+</code></pre>
+
+<table>
+<tr><th>时刻</th><th>进入哪种记忆</th><th>为什么</th></tr>
+<tr><td>用户刚说出来</td><td>A：Working Memory</td><td>当前对话必须立即使用。</td></tr>
+<tr><td>同一 Turn 落盘</td><td>F：Transcript</td><td>进程崩溃后仍能恢复这句话。</td></tr>
+<tr><td>长任务进行中</td><td>C：SessionMemory</td><td>Compact 后仍需继续遵守。</td></tr>
+<tr><td>完整任务结束</td><td>D：feedback memory</td><td>未来 Session 仍应遵守。</td></tr>
+<tr><td>第二天新 Session</td><td>D → Recall</td><td>根据“运行测试”语义召回。</td></tr>
+<tr><td>如果这是组织强制规则</td><td>更适合 B：CLAUDE.md</td><td>确定性规则不应该依赖概率性的自动学习。</td></tr>
+</table>
+
+<div class="good callout">
+<strong>这就是理解 Claude Code Memory 最重要的视角：</strong>
+同一条信息可以在生命周期中从“工作记忆”流向“恢复日志”，再被提炼为“会话摘要”，最后晋升为“长期语义记忆”；但如果它本来就是确定性政策，最合适的归宿反而是 CLAUDE.md，而不是 Auto Memory。
+</div>
+
+<h1>十二、从“存储”角度再归纳一次</h1>
+
+<pre><code>RAM
+├─ QueryEngine.mutableMessages
+├─ readFileState
+├─ ToolUseContext
+└─ loadedNestedMemoryPaths
+
+Workspace / User Files
+├─ CLAUDE.md / .claude/rules
+├─ .claude/agent-memory/
+└─ .claude/agent-memory-local/
+
+Claude Config Home
+├─ projects/&lt;repo&gt;/memory/
+│  ├─ MEMORY.md
+│  └─ topic memories
+├─ session-memory/
+│  └─ &lt;session&gt;.md
+├─ agent-memory/
+│  └─ &lt;agent-type&gt;/
+└─ projects/&lt;repo&gt;/
+   └─ &lt;session-id&gt;.jsonl   (Transcript)
+
+Workspace Recovery
+└─ FileHistory snapshots
+</code></pre>
+
+<h1>十三、从“读取方式”角度归纳</h1>
+
+<table>
+<tr><th>记忆</th><th>读取策略</th></tr>
+<tr><td>Working Memory</td><td>直接存在 RAM，每次 Query 使用。</td></tr>
+<tr><td>CLAUDE.md</td><td>启动时主动加载；嵌套目录按需发现。</td></tr>
+<tr><td>SessionMemory</td><td>后台维护；Context Compact 时重点消费。</td></tr>
+<tr><td>MEMORY.md</td><td>会话入口长期加载，保持小而稳定。</td></tr>
+<tr><td>Topic Auto Memory</td><td>Manifest scan → Side Query → 只读取 relevant files。</td></tr>
+<tr><td>Agent Memory</td><td>Agent definition/scope 对应目录加载。</td></tr>
+<tr><td>Team Memory</td><td>条件启用后同步/加载团队 scope。</td></tr>
+<tr><td>Transcript</td><td>正常运行追加写；Resume 时全/分段读取并重建。</td></tr>
+<tr><td>FileHistory</td><td>Rewind/Resume 等恢复路径读取。</td></tr>
+</table>
+
+<h1>十四、从“写入主体”角度归纳</h1>
+
+<table>
+<tr><th>记忆</th><th>谁写</th></tr>
+<tr><td>Working Memory</td><td>QueryEngine / queryLoop / Tool Runtime。</td></tr>
+<tr><td>CLAUDE.md</td><td>主要由用户/团队人工维护；Claude 也可按用户要求修改。</td></tr>
+<tr><td>SessionMemory</td><td>受限 Forked SessionMemory Agent。</td></tr>
+<tr><td>Auto Memory</td><td>Main Agent 或 extractMemories Forked Agent。</td></tr>
+<tr><td>AutoDream consolidation</td><td>低频后台整理 Agent。</td></tr>
+<tr><td>Agent Memory</td><td>对应 Agent Runtime。</td></tr>
+<tr><td>Team Memory</td><td>Team memory writer + sync subsystem。</td></tr>
+<tr><td>Transcript</td><td>QueryEngine / Session Storage。</td></tr>
+<tr><td>FileHistory</td><td>File edit / checkpoint infrastructure。</td></tr>
+</table>
+
+<h1>十五、这套 Memory Architecture 的核心设计原则</h1>
+
+<ol>
+<li><strong>确定性规则与概率性学习分开。</strong>CLAUDE.md ≠ Auto Memory。</li>
+<li><strong>Working Memory 与 Durable Memory 分开。</strong>RAM 为性能，Transcript 为恢复。</li>
+<li><strong>Session Summary 与 Cross-session Learning 分开。</strong>SessionMemory ≠ Auto Memory。</li>
+<li><strong>Index 与正文分开。</strong>MEMORY.md 小而稳定，Topic files 按需读取。</li>
+<li><strong>Recall 与 Storage 分开。</strong>存很多并不代表每轮都注入很多。</li>
+<li><strong>按作用域隔离。</strong>User / Project / Local / Agent / Team 不混成一个 namespace。</li>
+<li><strong>Memory 要考虑 freshness。</strong>长期记忆不是实时数据库。</li>
+<li><strong>自动写入使用最小权限。</strong>后台 Memory Agent 不能随便改代码或执行副作用 Tool。</li>
+<li><strong>Recovery 恢复事实而不是 Runtime Object。</strong>新的 QueryEngine 从 Durable State 重新构造。</li>
+<li><strong>Cognitive State 与 World State 一起恢复。</strong>Transcript + FileHistory 配套。</li>
+</ol>
+
+<h1>十六、推荐的源码阅读顺序</h1>
+
+<ol>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/QueryEngine.ts"><code>src/QueryEngine.ts</code></a> —— 先理解 Working Memory 如何跨 Turn 活着。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/utils/claudemd.ts"><code>src/utils/claudemd.ts</code></a> —— 静态指令记忆。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/tree/main/src/memdir"><code>src/memdir/</code></a> —— 长期 Auto Memory 的存储/召回。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/tree/main/src/services/SessionMemory"><code>src/services/SessionMemory/</code></a> —— 会话滚动摘要。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/tree/main/src/services/extractMemories"><code>src/services/extractMemories/</code></a> —— 长期记忆自动写入。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/tree/main/src/services/autoDream"><code>src/services/autoDream/</code></a> —— Consolidation。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/tools/AgentTool/agentMemory.ts"><code>src/tools/AgentTool/agentMemory.ts</code></a> —— Agent scope。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/tree/main/src/services/teamMemorySync"><code>src/services/teamMemorySync/</code></a> —— Team scope。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/utils/sessionStorage.ts"><code>src/utils/sessionStorage.ts</code></a> —— Transcript。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/utils/conversationRecovery.ts"><code>src/utils/conversationRecovery.ts</code></a> —— Resume rehydration。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/tree/main/src/services/compact"><code>src/services/compact/</code></a> —— Context 与 Memory 如何在窗口限制下衔接。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/utils/fileHistory.ts"><code>src/utils/fileHistory.ts</code></a> —— Workspace Recovery。</li>
+</ol>
+
+<h1>十七、最终架构图</h1>
+
+<pre><code>                           Claude API
+                               ▲
+                               │
+                     ┌─────────┴─────────┐
+                     │ Context Builder   │
+                     └─────────┬─────────┘
+                               │
+      ┌────────────────────────┼────────────────────────┐
+      │                        │                        │
+      ▼                        ▼                        ▼
+A. Working Memory       B. Instruction Memory    D. Auto Memory
+mutableMessages         CLAUDE.md / rules         MEMORY.md index
+readFileState           managed/user/project     topic files
+ToolUseContext          local/nested              relevant recall
+      │                        │                        │
+      └──────────────┬─────────┴──────────┬────────────┘
+                     │                    │
+                     ▼                    ▼
+              Main Agent Loop       Semantic Context
+
+                 C. SessionMemory
+                 rolling notes
+                       │
+                       ▼
+               SessionMemory Compact
+                       │
+                       ▼
+             Active Context survives
+
+────────────────── Durable / Recovery Plane ──────────────────
+
+F. Transcript JSONL
+   + compact boundaries
+   + attachments / skill state
+          │
+          ▼
+conversationRecovery
+          │
+          ▼
+new QueryEngine Working Memory
+
+FileHistory
+   │
+   ▼
+Workspace State Recovery
+
+──────────────── Long-Term Learning Plane ────────────────────
+
+Stop Hook
+   │
+   ├─ Main Agent already wrote memory? → skip duplicate extraction
+   │
+   └─ extractMemories fork
+           │
+           ▼
+      D. Auto Memory
+
+Low-frequency:
+autoDream → consolidate / dedupe / prune
+
+──────────────── Scope Extensions ────────────────────────────
+
+E1. Agent Memory
+    user / project / local
+
+E2. Team Memory
+    shared project knowledge
+</code></pre>
+
+<h1>十八、一句话总结</h1>
+
+<blockquote>
+<p><strong>Claude Code 不是“短期 Memory + 长期 Memory”两层结构，而是按职责拆成 6 类：</strong>QueryEngine 提供 RAM 工作记忆；CLAUDE.md 提供确定性静态指令；SessionMemory 保存当前长会话的滚动工作摘要；memdir 的 MEMORY.md + topic files 保存跨会话长期经验并按语义选择性召回；Agent/Team Memory 提供独立作用域；Transcript + Compact metadata + FileHistory 保存会话和工作区的可恢复事实。一次信息会根据价值沿不同路径流动：先进入 Working Memory，同时写 Transcript；如果会话足够长则进入 SessionMemory；如果对未来有持续价值则由 Main Agent 或 extractMemories 晋升为 Auto Memory；下一次新 Session 再通过 MEMORY.md + manifest + side-query 召回，而同一 Session 的 Resume 则走 Transcript Rehydration。理解这条“存储—提炼—压缩—召回—恢复”流水线，比把源码模块逐个列出来更接近 Claude Code 真正的 Memory Architecture。</p>
+</blockquote>
+
+</article>
+</div>
+<script>
+const toc=document.getElementById('toc');
+const seen=new Map();
+const headings=[...document.querySelectorAll('article h1,article h2,article h3')];
+headings.forEach((h,i)=>{
+  const base=h.textContent.trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu,'-').replace(/^-|-$/g,'')||`section-${i+1}`;
+  const n=seen.get(base)||0;seen.set(base,n+1);h.id=n?`${base}-${n+1}`:base;
+  const a=document.createElement('a');a.href=`#${h.id}`;a.textContent=h.textContent;
+  if(h.tagName==='H2')a.className='sub';if(h.tagName==='H3')a.className='sub3';toc.appendChild(a);
+});
+const links=[...toc.querySelectorAll('a')];
+function active(){
+  let cur=headings[0];
+  for(const h of headings){if(h.getBoundingClientRect().top<=105)cur=h;else break}
+  links.forEach(a=>a.classList.toggle('active',a.getAttribute('href')===`#${cur.id}`));
+}
+addEventListener('scroll',active,{passive:true});
+addEventListener('resize',active);
+active();
+</script>
+</body>
+</html>

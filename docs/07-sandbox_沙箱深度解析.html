@@ -1,0 +1,559 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Claude Code Sandbox 源码级解析</title>
+<style>
+:root{--bg:#f6f8fc;--panel:#fff;--text:#202431;--muted:#667085;--line:#e2e6ef;--accent:#5b5bd6;--code:#121722;--codeText:#eef2f7}
+@media(prefers-color-scheme:dark){:root{--bg:#10131a;--panel:#181c25;--text:#edf1f7;--muted:#aab2c0;--line:#303746;--accent:#aaa2ff;--code:#0b0e14;--codeText:#e7eaf0}}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.75 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.layout{width:min(1500px,100%);margin:auto;display:grid;grid-template-columns:310px minmax(0,980px);gap:30px;padding:28px 32px 54px;justify-content:center;align-items:start}
+aside{position:sticky;top:20px;height:calc(100vh - 40px);overflow:auto;padding:18px 16px 22px;background:var(--panel);border:1px solid var(--line);border-radius:14px}
+aside strong{display:block;margin-bottom:10px;padding:0 8px 10px;border-bottom:1px solid var(--line)}
+#toc{display:flex;flex-direction:column;gap:2px}#toc a{display:block;color:var(--muted);text-decoration:none;padding:6px 9px;border-left:3px solid transparent;border-radius:6px;font-size:13.5px;line-height:1.42}
+#toc a.sub{padding-left:22px;font-size:13px}#toc a.sub3{padding-left:34px;font-size:12.4px}#toc a:hover,#toc a.active{color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent)}#toc a.active{border-left-color:var(--accent);font-weight:650}
+article{min-width:0;padding:42px 52px;background:var(--panel);border:1px solid var(--line);border-radius:16px}
+h1,h2,h3{line-height:1.3;scroll-margin-top:24px}h1{margin:1.8em 0 .65em;font-size:2.1rem;border-bottom:1px solid var(--line);padding-bottom:.35em}article>h1:first-child{margin-top:0;font-size:2.55rem}
+h2{margin:1.7em 0 .55em;font-size:1.55rem}h3{margin:1.4em 0 .45em;font-size:1.16rem;color:var(--accent)}
+blockquote{margin:1.2em 0;padding:.85em 1.15em;border-left:4px solid var(--accent);background:color-mix(in srgb,var(--accent) 7%,transparent)}
+code{font-family:Consolas,monospace;font-size:.92em;background:color-mix(in srgb,var(--accent) 9%,transparent);padding:.12em .35em;border-radius:4px}
+pre{overflow:auto;padding:18px 20px;border-radius:10px;background:var(--code);color:var(--codeText);line-height:1.52}pre code{padding:0;background:none;color:inherit}
+table{width:100%;border-collapse:collapse;margin:1.3em 0;display:block;overflow:auto}th,td{border:1px solid var(--line);padding:9px 12px;text-align:left;vertical-align:top}th{background:color-mix(in srgb,var(--accent) 9%,transparent)}
+.note{padding:14px 16px;border-radius:10px;margin:16px 0;border:1px solid color-mix(in srgb,var(--accent) 30%,var(--line));background:color-mix(in srgb,var(--accent) 7%,transparent)}
+.warn{padding:14px 16px;border-radius:10px;margin:16px 0;border:1px solid #e6b64a;background:color-mix(in srgb,#e6b64a 10%,transparent)}
+a{color:var(--accent)}@media(max-width:980px){.layout{display:block;padding:14px}aside{position:relative;top:auto;height:auto;max-height:42vh;margin-bottom:14px}article{padding:26px 22px}}
+</style></head><body><div class="layout"><aside><strong>目录</strong><nav id="toc"></nav></aside><article>
+<h1>Claude Code 的 Sandbox 是什么？如何实现？运行时起什么作用？</h1>
+<blockquote><p><strong>核心结论：</strong>Claude Code 的 Sandbox 不是独立容器，也不是简单在 Bash 前“套一层 bwrap”。它是嵌入 <code>BashTool</code> 执行链的 OS 级执行隔离层：上层由 Settings、Permission 和 Bash Permission 决定命令是否进入沙箱以及是否可以自动放行；<code>sandbox-adapter.ts</code> 把 Claude Code 的权限语义翻译成文件系统和网络策略；底层由 <code>@anthropic-ai/sandbox-runtime</code> 使用 macOS Seatbelt / <code>sandbox-exec</code> 或 Linux Bubblewrap + 网络代理约束整个进程树；执行结束后还会做 violation annotation 与安全清理。</p></blockquote>
+<div class="warn"><strong>源码边界：</strong>本文主要依据恢复源码中的 <code>src/tools/BashTool/*</code>、<code>src/utils/Shell.ts</code>、<code>src/utils/sandbox/sandbox-adapter.ts</code>、<code>src/utils/permissions/pathValidation.ts</code> 等，并用 Anthropic 官方 Sandbox Runtime 与 Claude Code Sandboxing 文档补充 OS 层实现。底层 runtime 能 sandbox 任意 process/MCP server，不代表 Claude Code 恢复源码中的产品级主接入已经覆盖所有这些场景；当前最明确的内建主链仍是 Sandboxed Bash。</div>
+
+<h1>一、Sandbox 的准确定位</h1>
+<h2>1.1 Permission、Hook 和 Sandbox 分别控制什么？</h2>
+<table><tr><th>机制</th><th>核心问题</th><th>位置</th></tr>
+<tr><td>Permission</td><td>这个 Tool Call 能不能启动？</td><td>Tool Runtime / Bash permission / 用户审批</td></tr>
+<tr><td>Sandbox</td><td>启动后，进程及子进程真正能访问什么？</td><td>OS-level execution boundary</td></tr>
+<tr><td>Hook</td><td>生命周期中外部策略是否修改输入、上下文或 allow/ask/deny？</td><td>PreToolUse / PostToolUse / Failure</td></tr></table>
+<pre><code>Claude tool_use: Bash
+  ↓
+PreToolUse Hook
+  ↓
+Permission Resolution
+  ↓
+BashTool.call()
+  ↓
+shouldUseSandbox()
+  ↓
+OS Sandbox
+  ↓
+real process + child processes
+</code></pre>
+<p><strong>Permission 是动作授权，Sandbox 是执行后能力约束。</strong></p>
+
+<h2>1.2 为什么 Coding Agent 需要 OS 级隔离？</h2>
+<p>Bash 可以继续启动 Python、Node、Git、curl、npm script、编译器、测试框架等任意子进程。只检查最外层命令字符串无法约束后续进程树。Sandbox 把边界下沉到 OS：即使命令或子进程行为被 Prompt Injection 改变，也不能轻易越过文件和网络边界。</p>
+
+<h1>二、核心源码模块</h1>
+<table><tr><th>文件</th><th>职责</th></tr>
+<tr><td><code>src/tools/BashTool/shouldUseSandbox.ts</code></td><td>逐次 Bash 调用决定是否进 Sandbox。</td></tr>
+<tr><td><code>src/tools/BashTool/bashPermissions.ts</code></td><td>Sandbox Auto-Allow 与显式 Bash allow/ask/deny 融合。</td></tr>
+<tr><td><code>src/tools/BashTool/BashTool.tsx</code></td><td>把 <code>shouldUseSandbox(input)</code> 传给 Shell，并处理输出/违规。</td></tr>
+<tr><td><code>src/utils/Shell.ts</code></td><td>真正调用 <code>wrapWithSandbox()</code>、spawn 进程、执行后 cleanup。</td></tr>
+<tr><td><code>src/utils/sandbox/sandbox-adapter.ts</code></td><td>Claude Code settings → SandboxRuntimeConfig；初始化、更新、依赖检测、网络 callback。</td></tr>
+<tr><td><code>src/utils/permissions/pathValidation.ts</code></td><td>Sandbox write allowlist 反向参与应用层路径权限。</td></tr>
+<tr><td><code>SandboxPermissionRequest.tsx</code></td><td>网络越界审批 UI。</td></tr>
+<tr><td><code>SandboxDoctorSection.tsx</code></td><td>平台/依赖诊断。</td></tr></table>
+
+<h1>三、完整运行时调用链</h1>
+<pre><code>User
+ │
+ ▼
+queryLoop / Claude
+ │ tool_use: Bash
+ ▼
+Tool Runtime
+ ├─ Schema / validateInput
+ ├─ PreToolUse Hooks
+ └─ Permission Resolution
+        ↓
+Bash Permission
+        ↓
+BashTool.call()
+        ↓
+shouldUseSandbox(input)
+ ├─ sandbox unavailable → false
+ ├─ dangerouslyDisableSandbox allowed → false
+ ├─ excluded command → false
+ └─ otherwise → true
+        ↓
+exec(..., { shouldUseSandbox })
+        ↓
+Shell.ts
+ ├─ false → normal shell
+ └─ true
+      ↓
+SandboxManager.wrapWithSandbox()
+      ↓
+sandbox-adapter.ts
+      ↓
+@anthropic-ai/sandbox-runtime
+      ├─ macOS: Seatbelt / sandbox-exec
+      └─ Linux/WSL2: bubblewrap + namespace/bind mounts
+      ↓
+network proxy / domain policy
+      ↓
+real command + child process tree
+      ↓
+violation annotation
+      ↓
+cleanupAfterCommand()
+      ↓
+scrubBareGitRepoFiles()
+      ↓
+Bash tool_result → queryLoop
+</code></pre>
+
+<h1>四、命令何时进入 Sandbox？</h1>
+<h2>4.1 <code>shouldUseSandbox()</code></h2>
+<pre><code>if sandbox not enabled:
+  return false
+
+if dangerouslyDisableSandbox
+   and unsandboxed commands are allowed:
+  return false
+
+if no command:
+  return false
+
+if command matches excludedCommands:
+  return false
+
+return true
+</code></pre>
+<p>所以 <code>sandbox.enabled=true</code> 不代表每条命令必然进入 Sandbox。单次 Tool Input 和策略会影响路由。</p>
+
+<h2>4.2 <code>dangerouslyDisableSandbox</code></h2>
+<p>BashTool Schema 中存在该字段。只有 <code>allowUnsandboxedCommands</code> 允许时，它才会使本次调用不进 Sandbox；此时命令应重新依赖普通 Permission 流程，而不是自动获得无限权限。</p>
+
+<h2>4.3 <code>excludedCommands</code> 不是安全边界</h2>
+<p>源码注释明确说明它是兼容性/便利特性。某些命令可能因为运行机制与 Sandbox 不兼容而被排除，但真正安全边界仍是 Permission System + OS Sandbox Runtime。</p>
+
+<h1>五、Sandbox 如何和 Permission 协同？</h1>
+<h2>5.1 Auto-Allow 不是无条件放行</h2>
+<pre><code>sandbox enabled
+  + autoAllowBashIfSandboxed
+  + current command really sandboxed
+          ↓
+check sandbox auto-allow
+          ├─ explicit deny → deny
+          ├─ explicit ask → ask
+          ├─ compound subcommand deny/ask → respect
+          └─ otherwise → allow because sandboxed
+</code></pre>
+<p>设计目的：先尊重明确安全策略，再利用 OS 边界减少“每条 Bash 都点一次允许”的 approval fatigue。</p>
+
+<h2>5.2 Defense in Depth</h2>
+<p>Permission 管意图和产品规则，Sandbox 管真实 OS 行为。即使模型获得某条 Bash 的执行许可，进程树也只能在 Sandbox 配置允许的文件系统与网络边界内运行。</p>
+
+<h1>六、Settings 如何翻译成底层隔离策略？</h1>
+<h2>6.1 <code>convertToSandboxRuntimeConfig()</code></h2>
+<p>它会同时读取 <code>settings.permissions</code>、<code>settings.sandbox</code>、cwd、additional directories、worktree、managed policy 与内建安全规则，统一生成 <code>SandboxRuntimeConfig</code>。</p>
+<pre><code>allowWrite = ['.', ClaudeTempDir]
+denyWrite = []
+denyRead  = []
+allowRead = []
+</code></pre>
+<p>随后再把各 settings source 中的 FileEdit/FileRead 规则与 <code>sandbox.filesystem.*</code> 合并进这些集合。</p>
+
+<h2>6.2 两套路径语义不能混淆</h2>
+<table><tr><th>来源</th><th><code>/foo</code> 的含义</th></tr>
+<tr><td><code>permissions.allow = ["Edit(/foo)"]</code></td><td>Claude Code 特殊语义：相对 settings 文件目录。</td></tr>
+<tr><td><code>sandbox.filesystem.allowWrite = ["/foo"]</code></td><td>标准语义：绝对路径。</td></tr></table>
+<p>源码因此分别提供 <code>resolvePathPatternForSandbox()</code> 与 <code>resolveSandboxFilesystemPath()</code>。</p>
+
+<h1>七、保护 Claude Code 自己的控制平面</h1>
+<h2>7.1 Settings 强制 denyWrite</h2>
+<p>如果 Sandbox 内脚本能修改权限或 Sandbox 配置，它就可能通过“改变策略”逃逸。因此 settings 文件和 managed settings drop-in 会被加入 denyWrite。</p>
+
+<h2>7.2 <code>.claude/skills</code> 强制 denyWrite</h2>
+<p>恢复源码明确保护 original cwd / current cwd 下的 <code>.claude/skills</code>。原因是 Skill 会被自动发现/加载，具有高权限执行能力；Sandbox 内不可信代码不能对它进行持久化投毒。</p>
+
+<h2>7.3 Git bare-repo 残留清理</h2>
+<p>源码还保护/清理 <code>HEAD</code>、<code>objects</code>、<code>refs</code>、<code>hooks</code>、<code>config</code> 等路径，避免 Sandbox 内构造 bare-repo 结构影响后续 unsandboxed Git。</p>
+<pre><code>execution restrictions
+   ↓
+sandboxed command
+   ↓
+cleanupAfterCommand()
+   ↓
+scrubBareGitRepoFiles()
+</code></pre>
+
+<h1>八、网络隔离</h1>
+<h2>8.1 应用层规则如何进入网络 Sandbox？</h2>
+<p><code>sandbox.network.allowedDomains</code> 会直接进入 Runtime Config；同时，类似 <code>WebFetch(domain:example.com)</code> 的 Permission Rule 也会被转换为 Sandbox domain allowlist，使应用层 Web 权限和 Bash/curl 的底层网络限制保持一致。</p>
+
+<h2>8.2 底层代理模型</h2>
+<pre><code>Sandboxed process
+   ↓
+HTTP proxy / SOCKS5 proxy
+   ↓
+allowedDomains / deniedDomains
+   ├─ allowed → host network
+   └─ denied/unknown → block or ask
+</code></pre>
+<p>Linux/WSL2 使用 Bubblewrap 的 network namespace，并通过 Unix Domain Socket + <code>socat</code> 把允许流量转给宿主代理；macOS Seatbelt 只允许访问指定 localhost proxy 端口，其他直接网络访问被系统策略阻断。底层 <code>@anthropic-ai/sandbox-runtime</code> 的原生 Windows alpha 则使用 Windows Filtering Platform（WFP）按 <code>srt-sandbox</code> SID 阻断非代理端口出站连接，再由 HTTP/SOCKS5 proxy 执行 domain allowlist。</p>
+
+<h2>8.3 网络越界的人机交互</h2>
+<p><code>SandboxPermissionRequest.tsx</code> 专门处理 “Network request outside of sandbox”。如果企业设置 <code>allowManagedDomainsOnly</code>，适配层会拒绝临时放行 callback，UI 也会收缩“永久允许此域”的选项。</p>
+
+<h1>九、底层 OS 实现：macOS、Linux/WSL2 与 Windows</h1>
+
+<h2>9.1 Claude Code 是适配层，不直接实现 OS Sandbox</h2>
+<p><code>sandbox-adapter.ts</code> 从 <code>@anthropic-ai/sandbox-runtime</code> 导入 <code>SandboxManager as BaseSandboxManager</code>。Claude Code 负责把 Settings、Permission、cwd、Worktree、网络域名和 UI 决策转换为统一的 <code>SandboxRuntimeConfig</code>；底层 package 再根据操作系统选择具体的隔离后端。</p>
+
+<pre><code>Claude Code
+  ↓
+sandbox-adapter.ts
+  ↓
+SandboxRuntimeConfig
+  ↓
+@anthropic-ai/sandbox-runtime
+  ├─ macOS backend
+  ├─ Linux backend
+  └─ Windows backend（底层 runtime alpha）
+</code></pre>
+
+<div class="warn"><strong>必须区分两个层次：</strong><br>
+<strong>Claude Code 产品层：</strong>当前官方 Bash Sandbox 支持 macOS、Linux 和 WSL2；<strong>原生 Windows 仍不支持</strong>，Windows 用户官方路径是通过 WSL2 运行 Claude Code。<br>
+<strong>底层 <code>@anthropic-ai/sandbox-runtime</code>：</strong>已经提供原生 Windows alpha 后端。因此“底层 runtime 支持 Windows”不等于“Claude Code 当前已经正式支持 native Windows Sandbox”。</div>
+
+<h2>9.2 macOS：Seatbelt / sandbox-exec</h2>
+<p>macOS 使用 Apple Seatbelt。Sandbox Runtime 动态生成 Seatbelt Profile，再通过 <code>sandbox-exec</code> 启动目标进程。Profile 描述允许读取、允许写入、禁止访问以及允许连接的本地代理端口。</p>
+<pre><code>Claude Bash command
+  ↓
+generate Seatbelt profile
+  ↓
+sandbox-exec
+  ↓
+sandboxed process
+  ├─ filesystem syscall → Seatbelt policy
+  └─ network syscall → only allowed proxy port
+</code></pre>
+<p>Bash 后续启动的 Node、Python、Git、curl 等子进程仍继承同一 Seatbelt 边界。</p>
+
+<h2>9.3 Linux：Bubblewrap + Namespace + Bind Mount + Proxy</h2>
+<p>Linux 使用 Bubblewrap（<code>bwrap</code>）构造隔离视图，核心依赖 user namespace、mount namespace、network namespace 与 bind mount。workspace 和 session temp 等被允许的目录以 writable 方式暴露，其余区域只读或不可访问。</p>
+<pre><code>Host filesystem
+  ↓
+Bubblewrap
+  ├─ user namespace
+  ├─ mount namespace
+  ├─ bind mounts
+  └─ network namespace
+  ↓
+Sandbox filesystem view
+</code></pre>
+<p>网络方面，正常 network namespace 被隔离，HTTP/HTTPS/TCP 流量必须通过宿主机 HTTP/SOCKS5 proxy；Linux 中通常通过 Unix Domain Socket + <code>socat</code> 桥接到宿主代理。</p>
+
+<h2>9.4 Windows 上运行 Claude Code：官方实际路径是 WSL2</h2>
+<p>当前 Claude Code 官方文档仍明确写明 <strong>Native Windows is not supported</strong>。所以 Windows 用户启用 Claude Code Bash Sandbox 时，实际运行环境是 WSL2 中的 Linux，隔离后端仍然是 Bubblewrap：</p>
+<pre><code>Windows
+  ↓
+WSL2 Linux environment
+  ↓
+Claude Code
+  ↓
+BashTool
+  ↓
+Bubblewrap
+  ├─ filesystem namespace
+  ├─ bind mounts
+  └─ network namespace
+  ↓
+socat / sandbox proxy
+</code></pre>
+
+<h3>9.4.1 WSL2 的特殊问题：Windows Interop</h3>
+<p>WSL2 可以把 Windows 可执行文件的启动请求交给 Windows Host，例如 <code>cmd.exe</code>、<code>powershell.exe</code> 或 <code>/mnt/c/Windows/System32/*</code>。Claude Code 官方文档指出，这种 handoff 通过 Unix Socket 发生。</p>
+<pre><code>Sandboxed Bash in WSL2
+  ↓
+tries to launch powershell.exe
+  ↓
+WSL interop Unix socket
+  ↓
+seccomp / Unix-socket policy
+  ├─ blocked → cannot hand off to Windows host
+  └─ allowed → Windows host launches binary
+</code></pre>
+<p>因此在 WSL2 中，Bubblewrap 之外还需要治理 Unix Socket。可选 seccomp filter 能阻断相关 socket；<code>allowAllUnixSockets</code> 会放宽这一能力；某些与 Sandbox 不兼容的 Windows 命令也可以通过 <code>excludedCommands</code> 回到普通 Permission Flow。</p>
+
+<div class="note"><strong>关键理解：</strong>Windows + WSL2 场景里，Claude Code 自己并没有使用原生 Windows ACL/WFP 做产品级 Sandbox；它仍然是在 Linux Sandbox 中运行，只是必须额外防止 WSL Interop 成为跨到 Windows Host 的逃逸通道。</div>
+
+<h2>9.5 底层 Sandbox Runtime 的原生 Windows alpha</h2>
+<p>底层 <code>@anthropic-ai/sandbox-runtime</code> 已提供原生 Windows alpha。它不使用 Bubblewrap 或 Seatbelt，而是组合 Windows 自身的安全原语：</p>
+<pre><code>Dedicated local user
++ SID isolation
++ Restricted token
++ Job Object
++ NTFS ACL / ACE
++ Windows Filtering Platform (WFP)
++ HTTP/SOCKS5 proxy
+</code></pre>
+
+<h3>9.5.1 专用 <code>srt-sandbox</code> 本地用户</h3>
+<p>一次性安装命令：</p>
+<pre><code>npx @anthropic-ai/sandbox-runtime windows-install
+</code></pre>
+<p>它会创建 <code>srt-sandbox</code> 本地账户、<code>sandbox-runtime-users</code> 组，并安装以该账户 SID 为匹配条件的机器级 WFP filters。密码随机生成并使用 DPAPI 加密保存。</p>
+
+<p><code>srt-win.exe</code> 使用两阶段启动：</p>
+<pre><code>Developer account
+  ↓ broker
+CreateProcessWithLogonW
+  ↓
+srt-sandbox account
+  ↓
+restricted token
+  ↓
+Job Object
+  ↓
+target process + child processes
+</code></pre>
+<p>目标进程不是以当前开发者身份运行，而是使用独立 SID 和独立 profile（如 <code>%USERPROFILE%</code>、<code>%TEMP%</code>、HKCU），这是 Windows 原生后端最核心的身份隔离。</p>
+
+<h3>9.5.2 文件系统：NTFS DACL + 显式 ACE</h3>
+<p>Windows 没有 Linux mount namespace，因此文件隔离主要依赖 NTFS discretionary ACL。<code>srt-sandbox</code> 默认没有开发者私人文件的权限；Runtime 只针对允许路径增加该 SID 的显式 ACE。</p>
+<table>
+<tr><th>配置</th><th>Windows 行为</th></tr>
+<tr><td><code>filesystem.allowWrite</code></td><td>添加继承型 MODIFY ALLOW ACE。</td></tr>
+<tr><td><code>filesystem.allowRead</code></td><td>添加 READ | EXECUTE ALLOW ACE。</td></tr>
+<tr><td><code>denyRead / denyWrite</code></td><td>添加继承型 DENY ACE，并结合父目录 <code>FILE_DELETE_CHILD</code> DENY 防止 rename/delete 绕过。</td></tr>
+</table>
+<pre><code>NTFS object
+  ↓
+Security Descriptor / DACL
+  ↓
+ACE for srt-sandbox SID
+  ├─ ALLOW READ
+  ├─ ALLOW MODIFY
+  └─ DENY protected path
+</code></pre>
+<p>这些 ACE 是 additive 的，不覆盖原 Security Descriptor。Session 结束后 <code>reset()</code> 删除本次添加的 ACE；异常退出后，下次 initialize 还会做 crash-recovery cleanup。</p>
+
+<h3>9.5.3 网络：Windows Filtering Platform（WFP）</h3>
+<p>网络隔离由 WFP 完成。Runtime 在 <code>FWPM_LAYER_ALE_AUTH_CONNECT_V4/V6</code> 上安装规则：</p>
+<pre><code>process token contains srt-sandbox SID
+  ↓
+WFP ALE_AUTH_CONNECT
+  ├─ loopback + proxy port range → PERMIT
+  └─ all other outbound connect → BLOCK
+</code></pre>
+<p>默认只允许访问本地 proxy 端口范围（例如 <code>60080–60089</code>）。真正的 HTTP/SOCKS5 proxy 再做 domain allowlist：</p>
+<pre><code>srt-sandbox process
+  ↓
+127.0.0.1 proxy
+  ↓
+allowedDomains / deniedDomains
+  ↓
+Internet
+</code></pre>
+<p>因此即使程序删除 <code>HTTP_PROXY</code> / <code>HTTPS_PROXY</code> 环境变量并尝试直连，WFP 仍会在内核网络层拦截。环境变量只是“引导”，WFP 才是边界。</p>
+
+<h3>9.5.4 为什么独立 SID 很重要？</h3>
+<p>Windows 存在 Task Scheduler、BITS、COM 等间接进程创建路径。采用独立用户 SID 的好处是：即使子进程通过其他系统组件产生，只要仍携带 <code>srt-sandbox</code> SID，就继续受到 WFP 出站规则约束，并且对开发者文件没有天然访问权。</p>
+
+<h3>9.5.5 原生 Windows alpha 的限制</h3>
+<ul>
+<li>这是 <strong>sandbox-runtime alpha</strong>，不是 Claude Code 产品的 native Windows Sandbox。</li>
+<li>以另一个用户运行意味着 nvm/fnm、Scoop、per-user pip、<code>%LOCALAPPDATA%</code> 下的工具可能无法直接读取，需要 machine-wide 安装或显式 allowRead。</li>
+<li>Windows TLS/schannel 的证书吊销检查存在额外兼容性限制。</li>
+<li>allowRead/allowWrite 主要以 session-level ACL grant 实现，与 Linux 每次 exec 重建 namespace 的模型不同。</li>
+</ul>
+
+<h2>9.6 三个平台的技术对比</h2>
+<table>
+<tr><th>维度</th><th>macOS</th><th>Linux / Claude Code WSL2</th><th>原生 Windows（sandbox-runtime alpha）</th></tr>
+<tr><td>进程/身份边界</td><td>Seatbelt profile</td><td>Linux namespaces</td><td><code>srt-sandbox</code> SID + restricted token + Job Object</td></tr>
+<tr><td>文件系统</td><td>Seatbelt file policy</td><td>Bubblewrap bind mount / read-only view</td><td>NTFS DACL / ACE</td></tr>
+<tr><td>网络直接阻断</td><td>Seatbelt network policy</td><td>network namespace</td><td>WFP ALE_AUTH_CONNECT</td></tr>
+<tr><td>允许网络出口</td><td>localhost proxy</td><td>Unix socket + socat → host proxy</td><td>loopback proxy port range</td></tr>
+<tr><td>Domain 控制</td><td>HTTP/SOCKS5 proxy</td><td>HTTP/SOCKS5 proxy</td><td>HTTP/SOCKS5 proxy</td></tr>
+<tr><td>Claude Code 产品支持</td><td>支持</td><td>支持；Windows 通过 WSL2</td><td><strong>当前不支持</strong></td></tr>
+</table>
+
+<h1>十、BashTool → Shell → Sandbox Runtime</h1>
+<h2>10.1 BashTool 负责决策</h2>
+<pre><code>exec(command, abortSignal, 'bash', {
+  timeout,
+  preventCwdChanges,
+  shouldUseSandbox: shouldUseSandbox(input),
+  shouldAutoBackground
+})
+</code></pre>
+
+<h2>10.2 Shell.ts 负责真正 wrap</h2>
+<pre><code>if (shouldUseSandbox) {
+  commandString = await SandboxManager.wrapWithSandbox(
+    commandString,
+    sandboxBinShell,
+    undefined,
+    abortSignal
+  )
+}
+</code></pre>
+<p>因此职责非常清楚：BashTool = Tool semantics；Shell = process plumbing；SandboxManager = isolation wrapping。</p>
+
+<h2>10.3 执行完成后的 cleanup</h2>
+<pre><code>if (shouldUseSandbox) {
+  SandboxManager.cleanupAfterCommand()
+}
+</code></pre>
+<p>Claude Code 包装的 cleanup 还会执行 bare Git repo scrub，因此 Sandbox 生命周期覆盖“执行前—执行中—执行后”。</p>
+
+<h1>十一、Violation 与错误反馈</h1>
+<p>BashTool 会调用 <code>SandboxManager.annotateStderrWithSandboxFailures()</code>，把捕获到的 Sandbox violation 与当前命令输出关联。</p>
+<p>这样 Agent 可以区分：</p>
+<pre><code>程序本身报错
+vs
+Sandbox policy 阻止了文件/网络访问
+</code></pre>
+<p>这使 Sandbox 失败能够成为可解释的 <code>tool_result</code> Observation，Claude 可以请求域名权限、建议修改 allowlist、改用别的方案，或在策略允许时申请 unsandboxed fallback，而不是盲目修改业务代码。</p>
+
+<h1>十二、Sandbox 与其他模块的交互</h1>
+<h2>12.1 Tool Runtime / Hooks</h2>
+<pre><code>runToolUse
+ → Schema
+ → validateInput
+ → PreToolUse Hook
+ → Permission
+ → BashTool.call
+ → shouldUseSandbox
+ → OS Sandbox
+</code></pre>
+<p>Sandbox 不是 Hook，也不绕过 Tool Runtime。它发生在真正 Bash 执行阶段。PreToolUse Hook 若改变 Bash input，后续 Permission 与 BashTool 将基于处理后的输入继续。</p>
+
+<h2>12.2 Permission System</h2>
+<ul><li>Sandbox 可以成为 Bash Auto-Allow 的依据。</li><li>显式 deny/ask 仍优先。</li><li>Permission 中的文件路径和 WebFetch domain 可以被下沉到底层 Sandbox policy。</li><li>Unsandboxed fallback 回到正常 Permission 流程。</li></ul>
+
+<h2>12.3 Settings</h2>
+<pre><code>settings change
+  ↓
+convertToSandboxRuntimeConfig()
+  ↓
+BaseSandboxManager.updateConfig()
+</code></pre>
+<p>源码订阅 settings change 并动态更新 Runtime Config；部分 refresh 路径强调同步，以减少 stale policy 的 race window。</p>
+
+<h2>12.4 Path Validation / File Tools</h2>
+<p><code>pathValidation.ts</code> 的 <code>isPathInSandboxWriteAllowlist()</code> 会读取 <code>SandboxManager.getFsWriteConfig()</code>。如果路径已经明确在 Sandbox write allowlist 中，应用层路径 Permission 可以把它作为额外 allow 信号，同时仍尊重 denyWithinAllow。</p>
+<pre><code>Permission rules → Sandbox config
+Sandbox config → Path permission
+</code></pre>
+
+<h2>12.5 REPL / UI</h2>
+<p><code>/sandbox</code> 是控制面：用户可以选择 Sandbox/Auto-Allow、unsandboxed fallback、查看 resolved config，并在 Linux/WSL2 检查依赖。网络越界则通过专门 Permission Dialog 回到 UI。</p>
+
+<h2>12.6 Git Worktree</h2>
+<p>Policy 会允许 linked worktree 对 main repo shared <code>.git</code> 元数据的必要写入，使 <code>git commit</code> 可工作；同时又针对 Git 逃逸路径增加专门清理。</p>
+
+<h2>12.7 MCP</h2>
+<div class="note">底层 <code>@anthropic-ai/sandbox-runtime</code> 官方支持 sandbox arbitrary processes、agents 与 MCP servers；但恢复源码中 Claude Code 最明确、最成熟的内建接入是 BashTool。应区分“底层库能力”和“Claude Code 主链已集成的能力”。</div>
+
+<h1>十三、初始化、依赖检测与严格模式</h1>
+<p><code>isSandboxingEnabled()</code> 的真实含义不是只读 <code>sandbox.enabled</code>，还会考虑平台、依赖和 enabled platform。</p>
+<pre><code>sandbox.enabled = true
+   ≠
+sandbox actually available
+</code></pre>
+<p><code>failIfUnavailable: true</code> 可以把 Sandbox 从“增强安全”升级为“启动必须满足的安全条件”；<code>allowUnsandboxedCommands: false</code> 则关闭模型请求 unsandboxed 执行的 escape hatch。</p>
+
+<h1>十四、具体例子：npm test + 网络访问</h1>
+<p>用户：“运行测试，如果缺依赖就安装。” Claude 调用 <code>Bash("npm test")</code>：</p>
+<pre><code>tool_use
+ ↓
+PreToolUse / Permission
+ ↓
+sandbox auto-allow（若无显式 ask/deny）
+ ↓
+npm test 在 Sandbox 内执行
+ ↓
+node/test runner 子进程继承同一边界
+ ↓
+可以写 workspace / temp
+不能写 settings / .claude/skills / 未允许区域
+ ↓
+某脚本访问未知 registry domain
+ ↓
+network proxy blocks/asks
+ ↓
+SandboxPermissionRequest
+ ↓
+allow / deny
+ ↓
+violation 或正常结果
+ ↓
+tool_result
+ ↓
+queryLoop 继续
+</code></pre>
+<p>这体现了 Sandbox 的核心价值：它不是简单“阻止 Agent”，而是把越界行为变成<strong>受控失败 + 可解释 Observation</strong>，再交还模型重新规划。</p>
+
+<h1>十五、Sandbox 在整体架构中的位置</h1>
+<pre><code>Agent Runtime
+QueryEngine / queryLoop
+        ↓ tool_use
+Tool Runtime
+Schema / Hooks / Permission
+        ↓ allowed Bash
+Bash Execution Runtime
+BashTool → Shell
+        ↓
+Sandbox Adapter
+Settings / Permission → SandboxRuntimeConfig
+        ↓
+@anthropic-ai/sandbox-runtime
+  ├─ macOS: Seatbelt
+  ├─ Linux/WSL2: Bubblewrap + namespace
+  └─ Windows runtime alpha: SID + ACL + WFP
+        ↓
+OS process + child process tree
+</code></pre>
+
+<h1>十六、最容易混淆的三个概念</h1>
+<table><tr><th>概念</th><th>本质</th><th>作用</th></tr>
+<tr><td>Permission</td><td>应用层授权</td><td>决定 Tool 是否启动。</td></tr>
+<tr><td>Sandbox</td><td>OS 级 capability containment</td><td>决定启动后的进程真正能触达什么。</td></tr>
+<tr><td>Container / VM</td><td>更完整环境隔离</td><td>不是 Claude Code 本地 Bash Sandbox 的主要实现；本地方案强调轻量 OS primitives。</td></tr></table>
+
+<h1>十七、对 Agent Harness 设计的启发</h1>
+<ol>
+<li><strong>Authorization 与 Containment 分离。</strong></li>
+<li><strong>应用层 Permission 与 OS Sandbox Policy 使用同一语义来源。</strong></li>
+<li><strong>用 Sandbox 换取更少审批和更高 autonomy。</strong></li>
+<li><strong>优先保护 Settings、Skills、Hooks、Agent definitions 等控制平面。</strong></li>
+<li><strong>把 Sandbox violation 变成结构化 Observation。</strong></li>
+<li><strong>考虑执行后宿主机残留和 Git 等特殊攻击面。</strong></li>
+<li><strong>为企业提供 fail-closed 模式。</strong></li>
+</ol>
+
+<h1>十八、最终总结</h1>
+<blockquote><p><strong>Claude Code 的 Sandbox 可以定义为“嵌入 Bash Tool Runtime 的 OS 级能力约束层”。</strong>Tool Runtime 与 Permission 决定动作是否允许；<code>shouldUseSandbox()</code> 决定当前 Bash 是否进入隔离；<code>sandbox-adapter.ts</code> 把 Settings、Permission、cwd、Worktree 和网络策略转换为 <code>SandboxRuntimeConfig</code>；<code>Shell.ts</code> 再通过 <code>@anthropic-ai/sandbox-runtime</code> 进入具体 OS 后端。Claude Code 当前正式产品路径是 macOS Seatbelt 与 Linux/WSL2 Bubblewrap；Windows 用户通过 WSL2 使用。底层 sandbox-runtime 已提供原生 Windows alpha，通过独立 <code>srt-sandbox</code> SID、restricted token/Job Object、NTFS ACL/ACE 和 WFP 出站 fence 实现隔离，但这不等于 Claude Code 已正式支持 native Windows Sandbox。无论哪种后端，核心目标都是让整个进程树继承文件和网络边界，并把违规转换成可解释 Observation，与 Permission、Path Validation、Settings、REPL UI、Git Worktree 和 Tool Runtime 共同形成 defense-in-depth。</p></blockquote>
+
+<h1>十九、源码与官方资料</h1>
+<ul>
+<li><a href="https://github.com/liuup/claude-code-analysis/blob/main/src/tools/BashTool/shouldUseSandbox.ts">shouldUseSandbox.ts</a></li>
+<li><a href="https://github.com/liuup/claude-code-analysis/blob/main/src/tools/BashTool/bashPermissions.ts">bashPermissions.ts</a></li>
+<li><a href="https://github.com/liuup/claude-code-analysis/blob/main/src/tools/BashTool/BashTool.tsx">BashTool.tsx</a></li>
+<li><a href="https://github.com/liuup/claude-code-analysis/blob/main/src/utils/Shell.ts">Shell.ts</a></li>
+<li><a href="https://github.com/liuup/claude-code-analysis/blob/main/src/utils/sandbox/sandbox-adapter.ts">sandbox-adapter.ts</a></li>
+<li><a href="https://github.com/liuup/claude-code-analysis/blob/main/src/utils/permissions/pathValidation.ts">pathValidation.ts</a></li>
+<li><a href="https://github.com/anthropic-experimental/sandbox-runtime">Anthropic Sandbox Runtime</a></li>
+<li><a href="https://code.claude.com/docs/en/sandboxing">Claude Code 官方 Sandboxing 文档</a></li>
+<li><a href="https://www.anthropic.com/engineering/claude-code-sandboxing">Anthropic Engineering：Claude Code Sandboxing</a></li>
+</ul>
+
+</article></div>
+<script>
+const toc=document.getElementById('toc'),seen=new Map(),heads=[...document.querySelectorAll('article h1,article h2,article h3')];
+heads.forEach((h,i)=>{const b=h.textContent.trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu,'-').replace(/^-|-$/g,'')||`section-${i+1}`,n=seen.get(b)||0;seen.set(b,n+1);h.id=n?`${b}-${n+1}`:b;const a=document.createElement('a');a.href=`#${h.id}`;a.textContent=h.textContent;if(h.tagName==='H2')a.className='sub';if(h.tagName==='H3')a.className='sub3';toc.appendChild(a)});
+const links=[...toc.querySelectorAll('a')];function active(){let c=heads[0];for(const h of heads){if(h.getBoundingClientRect().top<=105)c=h;else break}links.forEach(a=>a.classList.toggle('active',a.getAttribute('href')===`#${c.id}`))}
+addEventListener('scroll',active,{passive:true});addEventListener('resize',active);active();
+</script></body></html>

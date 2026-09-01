@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Claude Code：Skill 与 Tool 的关系、选择机制与 PPT 生成案例</title>
+<style>
+body{margin:0;background:#f6f8fb;color:#1f2937;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;line-height:1.75}
+.wrap{max-width:1120px;margin:auto;padding:40px 24px 70px}
+section{background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:28px 32px;margin:22px 0;box-shadow:0 7px 24px rgba(15,23,42,.04)}
+.hero{background:linear-gradient(135deg,#fff,#f2f6ff)}
+h1{font-size:34px;line-height:1.25;margin:0 0 14px}h2{font-size:26px;border-left:5px solid #2563eb;padding-left:12px;margin-top:34px}h3{font-size:20px;margin-top:24px}
+p{margin:10px 0}.lead{font-size:18px;color:#374151}.small{font-size:14px;color:#6b7280}
+.note,.tip,.warn{padding:14px 16px;border-radius:10px;margin:16px 0}.note{background:#eff6ff;border:1px solid #bfdbfe}.tip{background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46}.warn{background:#fffbeb;border:1px solid #fde68a;color:#92400e}
+pre{background:#111827;color:#f9fafb;padding:18px 20px;border-radius:12px;overflow:auto;line-height:1.55}
+code{font-family:Consolas,Menlo,monospace}p code,li code,td code{background:#f3f4f6;padding:2px 6px;border-radius:5px}
+table{width:100%;border-collapse:collapse;margin:16px 0;font-size:14.5px}th,td{border:1px solid #e5e7eb;padding:11px 13px;text-align:left;vertical-align:top}th{background:#f9fafb}
+ul,ol{padding-left:24px}a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}
+</style>
+</head>
+<body><div class="wrap">
+
+<section class="hero">
+<h1>Claude Code 中 Skill 与 Tool：关系、选择机制与 PPT 生成案例</h1>
+<p class="lead">本文结合 BennettBin/Claude-code 恢复源码，系统说明 Skill 与 Tool 的结构关系、各自职责，以及 Claude 如何判断是直接使用原子 Tool，还是先调用 Skill；最后通过“PPT 生成”给出一条完整端到端调用链。</p>
+<div class="note"><b>核心结论：</b>Tool 是可执行的原子能力；Skill 是可复用的过程知识、工作流与运行配置。Claude Code 不是按“简单任务/复杂任务”硬分类，而是判断当前请求是否与某个 Available Skill 匹配。匹配时先调用 <code>SkillTool</code>，再由 Skill 指导 Agent 组合多个 Tool 完成任务。</div>
+<p class="small">说明：BennettBin/Claude-code 不是 Anthropic 官方开源仓库，而是依据公开发布物/source map 恢复出的源码树。</p>
+</section>
+
+<section>
+<h2>1. 总体关系</h2>
+<pre><code>User Request
+    │
+    ▼
+Agent Runtime / queryLoop()
+    │
+    ▼
+  Claude
+    │
+    │  根据当前上下文、Tool descriptions、
+    │  Skill index(name/description/whenToUse)做语义选择
+    │
+    ├──────────────────────────────────────────────────────┐
+    │                                                      │
+    ▼                                                      ▼
+直接选择原子 Tool                                      Skill 匹配
+    │                                                      │
+    ▼                                                      ▼
+tool_use: Read / Bash / Edit / Grep ...                 SkillTool
+    │                                                      │
+    ▼                                                      ▼
+Tool Runtime                                          Skill Registry
+runToolUse()                                              │
+    │                                                      ▼
+    ▼                                                   SKILL.md
+Tool Lookup                                               │
+    │                                           ┌──────────┴──────────┐
+    ▼                                           │                     │
+inputSchema.safeParse()                                Inline                Fork
+    │                                           │                     │
+    ▼                                           ▼                     ▼
+tool.validateInput()                         Prompt/SOP 注入          独立 Subagent
+    │                                           │                     │
+    ▼                                           └──────────┬──────────┘
+PreToolUse Hooks                                            │
+    │                                                       ▼
+    │  ├─ 可修改 input                                Claude 按 Skill 规划
+    │  ├─ allow / ask / deny                               │
+    │  ├─ additional context                               │
+    │  └─ preventContinuation                              ▼
+    ▼                                                Actual Tools
+Permission Resolution                             Read / Grep / Bash /
+    │                                             Edit / MCP / ...
+    │  ├─ Hook decision
+    │  ├─ settings rules
+    │  └─ user confirmation
+    ▼
+允许执行？
+  │
+  ├── No ───────────────→ error tool_result
+  │                           │
+  │                           ▼
+  │                       Agent Runtime
+  │
+  └── Yes
+       │
+       ▼
+    tool.call()
+       │
+       ├───────────────┐
+       │               │
+     success         exception / abort
+       │               │
+       ▼               ▼
+PostToolUse Hooks   PostToolUseFailure Hooks
+       │               │
+       └───────┬───────┘
+               ▼
+        Result Normalization
+               │
+        tool_result / attachments
+        contextModifier / progress
+               │
+               ▼
+        Agent Runtime / messages
+               │
+               ▼
+           queryLoop()
+               │
+               ▼
+       Claude 下一轮推理</code></pre>
+<div class="tip"><b>Skill 不替代 Tool，而是指导如何组合 Tool。</b></div>
+<p>左侧“直接原子执行”分支实际上也不是模型调用一个 Tool 后就直接进入 <code>tool.call()</code>。
+它会完整经过 Claude Code 的 Tool Runtime：Tool 查找、Schema 校验、Tool 语义校验、
+PreToolUse Hooks、Permission Resolution、真正执行、Post/Failure Hooks、结果标准化，
+最后把 <code>tool_result</code> 回填到 <code>messages</code>，再进入下一轮 <code>queryLoop()</code>。
+因此 Skill 路径与普通 Tool 路径最终都会汇入统一 Tool Runtime。</p>
+</section>
+
+<section>
+<h2>2. Tool：原子执行能力</h2>
+<p>Tool 基础抽象位于 <code>src/Tool.ts</code>。可以简化为：</p>
+<pre><code>Input
+  ↓
+Schema / Validation
+  ↓
+Permission
+  ↓
+call()
+  ↓
+Output</code></pre>
+<p>典型 Tool 包括 Read、Grep、Bash、Edit、MCPTool、AgentTool 和 SkillTool。</p>
+<p>Tool 解决的是：</p>
+<div class="tip">“现在已经决定要做某个动作，这个动作如何真正执行？”</div>
+<p>所以 Tool 更接近：</p>
+<pre><code>Capability Primitive
+=
+可执行的原子能力</code></pre>
+</section>
+
+<section>
+<h2>3. Skill：过程知识与复合能力</h2>
+<p>Skill 主要来自：</p>
+<pre><code>.claude/skills/&lt;skill-name&gt;/SKILL.md</code></pre>
+<p>加载逻辑主要位于 <code>src/skills/loadSkillsDir.ts</code>。Skill 被加载后更接近一个 prompt-based Command，而不是普通 Tool。</p>
+<p>Skill 可包含：</p>
+<ul>
+<li>name / description / whenToUse</li>
+<li>完整任务 SOP / Prompt</li>
+<li>allowedTools</li>
+<li>model override</li>
+<li>effort override</li>
+<li>hooks</li>
+<li>execution context：inline / fork</li>
+</ul>
+<p>Skill 解决的是：</p>
+<pre><code>“这类任务应该按什么流程做？
+优先检查什么？
+怎样组合工具？
+用什么模型和 effort？
+是否需要 fork 子 Agent？”</code></pre>
+<div class="tip">Skill 更接近 <b>SOP + Prompt + Runtime Configuration</b>。</div>
+</section>
+
+<section>
+<h2>4. SkillTool：Skill 与 Tool Runtime 的桥</h2>
+<p>源码中存在 <code>src/tools/SkillTool/SkillTool.ts</code>，其中 <code>SkillTool</code> 本身通过通用 Tool abstraction 构建，因此它确实是一个 Tool。</p>
+<p>它的典型输入可概括为：</p>
+<pre><code>{
+  "skill": "review-pr",
+  "args": "123"
+}</code></pre>
+<p>调用链：</p>
+<pre><code>Claude
+  ↓ tool_use
+SkillTool
+  ↓
+Skill Registry
+  ↓
+找到具体 Skill
+  ↓
+加载 SKILL.md
+  ↓
+展开 Prompt / Workflow</code></pre>
+<p>这样 Skill 就可以复用现有 Tool Runtime：</p>
+<pre><code>runToolUse()
+  ↓
+Schema Validation
+  ↓
+Permission
+  ↓
+SkillTool.call()
+  ↓
+tool_result</code></pre>
+<p>因此 <code>SkillTool</code> 最适合理解成一个 <b>Meta Tool / Bridge Tool</b>。</p>
+</section>
+
+<section>
+<h2>5. Skill 与 Tool 的核心区别</h2>
+<table>
+<tr><th>维度</th><th>Tool</th><th>Skill</th></tr>
+<tr><td>本质</td><td>可执行能力</td><td>任务知识 / 流程 / SOP</td></tr>
+<tr><td>典型实现</td><td>TypeScript Tool</td><td><code>SKILL.md</code> + metadata</td></tr>
+<tr><td>数据模型</td><td><code>Tool</code></td><td>Prompt-based Command</td></tr>
+<tr><td>核心内容</td><td><code>call()</code></td><td>Prompt / workflow / config</td></tr>
+<tr><td>主要问题</td><td>动作怎么执行</td><td>这类任务应该怎么做</td></tr>
+<tr><td>粒度</td><td>原子能力</td><td>复合能力</td></tr>
+<tr><td>是否组合多个能力</td><td>通常不是核心职责</td><td>是核心职责</td></tr>
+<tr><td>Model / Effort</td><td>通常不是重点</td><td>可覆盖</td></tr>
+<tr><td>Subagent</td><td>普通 Tool 不一定</td><td>可通过 <code>context: fork</code></td></tr>
+<tr><td>是否走 Tool Runtime</td><td>是</td><td>通过 SkillTool 间接走</td></tr>
+</table>
+<div class="tip">最直观的类比：<b>Skill = SOP；Tool = 设备。</b></div>
+</section>
+
+<section>
+<h2>6. Claude 如何决定是 Tool 还是 Skill？</h2>
+<div class="warn">源码里没有看到一个“简单任务 → Tool；复杂任务 → Skill”的显式分类器。</div>
+<p>真正更接近：</p>
+<pre><code>当前请求
+   ↓
+是否与某个 Available Skill 匹配？
+   │
+ ┌─┴─────────────┐
+ │               │
+Yes              No
+ │               │
+ ▼               ▼
+SkillTool       正常 Tool Selection
+ │               │
+ ▼               ▼
+完整 Skill      Read / Bash / Edit / ...</code></pre>
+<p>所以判断依据主要是：</p>
+<pre><code>是否存在与当前请求匹配的专用 Procedural Knowledge</code></pre>
+<h3>简单任务也可能用 Skill</h3>
+<p>如果存在专门的 commit Skill，那么“提交当前修改”即使不复杂，也可能先走 Skill。</p>
+<h3>复杂任务也可能不用 Skill</h3>
+<p>如果没有对应 Skill，一个跨多个模块的复杂 debugging 任务仍可以直接通过很长的 Read/Grep/Bash/Edit Agent Loop 完成。</p>
+<div class="note"><b>Skill ≠ 复杂任务；Tool ≠ 简单任务。</b></div>
+</section>
+
+<section>
+<h2>7. Skill Discovery：Claude 一开始并不会读取所有 SKILL.md</h2>
+<p>关键逻辑涉及 <code>src/commands.ts</code> 和 <code>src/tools/SkillTool/prompt.ts</code>。</p>
+<p><code>getSkillToolCommands()</code> 负责构建模型可主动调用的 Skill 候选集合；例如会考虑 prompt 类型、是否允许 model invocation 等。</p>
+<p>Claude 一开始看到的是轻量 Skill index：</p>
+<pre><code>name
++
+description
++
+whenToUse</code></pre>
+<p>然后由模型做语义匹配：</p>
+<pre><code>User Request
+      ↕
+Skill name / description / whenToUse</code></pre>
+<p>只有选中以后才：</p>
+<pre><code>SkillTool("xxx")
+   ↓
+加载完整 SKILL.md</code></pre>
+<div class="tip">这是一种 <b>Discovery → Selection → Lazy Full Loading</b>。</div>
+<p>这样可以显著减少大量 Skill 带来的上下文膨胀。</p>
+</section>
+
+<section>
+<h2>8. Skill 匹配后为什么要优先 Skill？</h2>
+<p><code>SkillTool/prompt.ts</code> 中的使用提示明确要求模型：如果某个 Skill 与当前请求匹配，应先调用相关 Skill，再继续处理任务。</p>
+<p>目的包括：</p>
+<ol>
+<li>避免模型临时 improvisation 绕过已有 SOP。</li>
+<li>复用组织沉淀的过程知识。</li>
+<li>提高同类任务执行的一致性。</li>
+<li>让 Skill 附带的 model / effort / hooks / allowed-tools 等配置生效。</li>
+</ol>
+<pre><code>有明确 Skill 匹配
+     ↓
+优先复用 Skill
+
+没有 Skill 匹配
+     ↓
+Claude 自主规划 + 原子 Tool</code></pre>
+</section>
+
+<section>
+<h2>9. PPT 生成案例：Skill 与 Tool 的完整选择和调用</h2>
+<div class="warn">下面的 <code>ppt-generation</code> Skill 是为了说明架构机制的示例，不代表仓库中必然存在同名内置 Skill。</div>
+
+<h3>9.1 用户请求</h3>
+<pre><code>“帮我根据项目里的季度经营数据，
+生成一份 10 页的管理层汇报 PPT，
+包含关键 KPI、趋势图、风险和下季度行动计划。”</code></pre>
+
+<p>该任务包含数据读取、内容理解、结构规划、图表选择、文案生成、幻灯片创建、渲染检查和修复等多个步骤。</p>
+<p>但 Claude 不是因为“它复杂”才调用 Skill，而是因为假设 Skill Registry 中存在一个明确匹配的 PPT Skill。</p>
+
+<h3>9.2 第一阶段：Skill Discovery</h3>
+<p>Claude 可能看到：</p>
+<pre><code>Available Skills:
+
+ppt-generation:
+Create professional presentation decks from source materials.
+Use when the user asks to create, revise, structure,
+or export a PowerPoint / slide presentation.
+
+code-review:
+Review code changes for correctness.
+
+debugging:
+Systematically diagnose software failures.</code></pre>
+
+<p>语义匹配：</p>
+<pre><code>User Request:
+“生成 10 页管理层 PPT”
+
+          ↓
+
+ppt-generation</code></pre>
+
+<p>于是先产生：</p>
+<pre><code>tool_use:
+Skill({
+  "skill": "ppt-generation",
+  "args": "Generate a 10-slide management deck from project quarterly data"
+})</code></pre>
+
+<h3>9.3 第二阶段：SkillTool 进入 Tool Runtime</h3>
+<pre><code>Claude
+  ↓
+Tool Runtime
+  ↓
+runToolUse()
+  ↓
+Schema Validation
+  ↓
+Permission
+  ↓
+SkillTool.call()</code></pre>
+
+<p>SkillTool 找到：</p>
+<pre><code>.claude/skills/ppt-generation/SKILL.md</code></pre>
+
+<h3>9.4 第三阶段：加载完整 PPT SOP</h3>
+<p>假设 Skill 内容大致为：</p>
+<pre><code>目标：
+生成管理层汇报 PPT。
+
+流程：
+1. 识别数据源。
+2. 提取最重要的 KPI。
+3. 形成 10 页以内的 story arc。
+4. 每页只表达一个核心信息。
+5. KPI 使用大数字卡片。
+6. 趋势数据优先 line/bar chart。
+7. 风险页包含影响、概率、缓解措施。
+8. 行动计划明确 owner / timing。
+9. 创建后检查文字溢出、标题和页码。
+10. 返回最终文件。
+
+Allowed tools:
+Read
+Grep
+Bash
+PresentationCreate
+PresentationEdit
+PresentationRender
+
+Model:
+strong reasoning model
+
+Effort:
+high</code></pre>
+
+<p>Skill 在这里提供的是“怎么做 PPT”的方法论，而不是 PPT 文件本身。</p>
+
+<h3>9.5 第四阶段：Skill 指导 Claude 组合 Tool</h3>
+<pre><code>Step 1
+Read("quarterly_report.csv")
+
+Step 2
+Read("business_review.md")
+
+Step 3
+Grep("risk|churn|revenue|margin", project_files)
+
+Step 4
+Claude 分析 KPI 和故事线
+
+Step 5
+PresentationCreate({
+  slides: 10,
+  title: "Q2 Business Review"
+})
+
+Step 6
+PresentationEdit(...)
+PresentationEdit(...)
+...
+
+Step 7
+PresentationRender(...)
+
+Step 8
+Claude 检查渲染结果
+
+Step 9
+PresentationEdit(...)
+修复文字溢出或图表标题
+
+Step 10
+返回最终 PPT</code></pre>
+
+<p>关系非常清楚：</p>
+<pre><code>Skill
+   │
+   │ 定义“应该怎么做”
+   ▼
+Claude Planning
+   │
+   ├── Read
+   ├── Grep
+   ├── Bash / Data Processing
+   ├── PresentationCreate
+   ├── PresentationEdit
+   └── PresentationRender</code></pre>
+
+<h3>9.6 如果系统没有 PPT Skill</h3>
+<p>Claude 仍然可能直接：</p>
+<pre><code>User Request
+   ↓
+Claude
+   ↓
+Read data
+   ↓
+自主规划 10 页
+   ↓
+PresentationCreate
+   ↓
+PresentationEdit
+   ↓
+Render</code></pre>
+<p>仍可能成功，但缺少专门 Skill 提供的故事线、图表原则、版式规则、质量检查和组织沉淀的最佳实践。</p>
+
+<h3>9.7 如果用户只是找一个 PPT 文件</h3>
+<p>例如：</p>
+<pre><code>“看看项目目录里有没有 .pptx 文件。”</code></pre>
+<p>这不一定与 PPT Skill 的 <code>whenToUse</code> 匹配，Claude 完全可以直接：</p>
+<pre><code>Glob("**/*.pptx")</code></pre>
+<div class="note"><b>出现“PPT”关键词 ≠ 必须调用 PPT Skill。真正依据仍是任务语义是否匹配 Skill 定义。</b></div>
+
+<h3>9.8 PPT 案例完整链路</h3>
+<pre><code>User
+ │
+ │ “生成一份 10 页管理层 PPT”
+ ▼
+Claude
+ │
+ │ Skill Discovery
+ │ 对比 name / description / whenToUse
+ ▼
+匹配 ppt-generation
+ │
+ ▼
+SkillTool("ppt-generation")
+ │
+ ▼
+Tool Runtime
+ │
+ ├── Schema
+ ├── Permission
+ └── SkillTool.call()
+        │
+        ▼
+   加载 SKILL.md
+        │
+        ▼
+   Prompt / SOP 注入
+        │
+        ▼
+      Claude
+        │
+        ├── Read quarterly data
+        ├── Grep risks
+        ├── 分析 KPI
+        ├── 规划 story arc
+        ├── PresentationCreate
+        ├── PresentationEdit
+        ├── PresentationRender
+        └── Quality Check
+        │
+        ▼
+     Final PPT</code></pre>
+</section>
+
+<section>
+<h2>10. 本质上是 Hierarchical Capability Routing</h2>
+<pre><code>                         Claude
+                           │
+          ┌────────────────┴────────────────┐
+          │                                 │
+     Atomic Tool                        SkillTool
+          │                                 │
+      Read/Grep                       Skill Registry
+      Bash/Edit                            │
+      MCP/...                         ppt-generation
+                                      review-pr
+                                      debugging
+          │                                 │
+          └────────────────┬────────────────┘
+                           ▼
+                    Tool Execution</code></pre>
+<p>可以理解成两层路由：</p>
+<pre><code>一级：
+选普通 Tool 还是 SkillTool
+
+二级：
+如果选 SkillTool，再选哪个 Skill</code></pre>
+<p>这种设计避免把大量 Skill 都平铺成独立 Tool Schema，同时支持按需加载。</p>
+</section>
+
+<section>
+<h2>11. 工程面试式总结</h2>
+<div class="tip">
+Claude Code 中 Tool 是由统一 Tool Runtime 执行的原子能力，例如 Read、Bash、Edit 和 MCP Tool；Skill 则是以 <code>SKILL.md</code> 为主体的可复用过程知识、任务工作流和运行配置。Skill 本身不是普通 Tool，而是通过特殊的 <code>SkillTool</code> 接入 Tool Runtime。Claude 也不是通过“简单任务/复杂任务分类器”决定用 Tool 还是 Skill，而是先看到可调用 Skill 的 name、description 和 <code>whenToUse</code> 等轻量元数据，再由模型进行语义匹配。存在匹配 Skill 时优先调用 SkillTool，并按需加载完整 <code>SKILL.md</code>；没有匹配 Skill 时，模型直接组合 Read、Bash、Edit 等原子 Tool。因此 Skill 的作用不是代替 Tool，而是规定复杂任务应该按什么 SOP 组合这些 Tool。
+</div>
+</section>
+
+<section>
+<h2>12. 关键源码入口</h2>
+<ul>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/Tool.ts"><code>src/Tool.ts</code></a> — Tool 基础抽象。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/skills/loadSkillsDir.ts"><code>src/skills/loadSkillsDir.ts</code></a> — Skill / SKILL.md 加载。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/tools/SkillTool/SkillTool.ts"><code>src/tools/SkillTool/SkillTool.ts</code></a> — SkillTool、inline/fork Skill。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/tools/SkillTool/prompt.ts"><code>src/tools/SkillTool/prompt.ts</code></a> — Skill Discovery 提示与匹配规则。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/commands.ts"><code>src/commands.ts</code></a> — <code>getSkillToolCommands()</code> 等候选集构建。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/services/tools/toolExecution.ts"><code>src/services/tools/toolExecution.ts</code></a> — SkillTool 与普通 Tool 共用的 Tool Runtime。</li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/query.ts"><code>src/query.ts</code></a> — Agent Loop 与 Tool Runtime 主连接点。</li>
+</ul>
+</section>
+
+</div></body></html>

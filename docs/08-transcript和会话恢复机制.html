@@ -1,0 +1,924 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Claude Code Transcript 与会话恢复源码级解析</title>
+<style>
+:root{
+  --bg:#f6f8fc;--panel:#fff;--text:#202431;--muted:#667085;--line:#e2e6ef;
+  --accent:#5b5bd6;--accentSoft:#f0f0ff;--good:#067647;--goodBg:#ecfdf3;
+  --warn:#93370d;--warnBg:#fffaeb;--bad:#b42318;--badBg:#fef3f2;
+  --code:#121722;--codeText:#eef2f7;
+}
+@media(prefers-color-scheme:dark){
+:root{--bg:#10131a;--panel:#181c25;--text:#edf1f7;--muted:#aab2c0;--line:#303746;
+--accent:#aaa2ff;--accentSoft:#26233d;--good:#75e0a7;--goodBg:#102a21;
+--warn:#fec84b;--warnBg:#33270f;--bad:#f97066;--badBg:#351817;--code:#0b0e14;--codeText:#e7eaf0}
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.76 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.layout{width:min(1540px,100%);margin:auto;display:grid;grid-template-columns:320px minmax(0,1000px);gap:30px;padding:28px 32px 54px;justify-content:center;align-items:start}
+aside{position:sticky;top:20px;height:calc(100vh - 40px);overflow:auto;padding:18px 16px 22px;background:var(--panel);border:1px solid var(--line);border-radius:14px}
+aside strong{display:block;margin-bottom:10px;padding:0 8px 10px;border-bottom:1px solid var(--line)}
+#toc{display:flex;flex-direction:column;gap:2px}
+#toc a{display:block;color:var(--muted);text-decoration:none;padding:6px 9px;border-left:3px solid transparent;border-radius:6px;font-size:13.5px;line-height:1.42}
+#toc a.sub{padding-left:22px;font-size:13px}#toc a.sub3{padding-left:34px;font-size:12.3px}
+#toc a:hover,#toc a.active{color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent)}
+#toc a.active{border-left-color:var(--accent);font-weight:650}
+article{min-width:0;padding:42px 52px;background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:0 12px 38px rgba(20,25,40,.06)}
+h1,h2,h3,h4{line-height:1.3;scroll-margin-top:24px}
+h1{margin:1.85em 0 .65em;font-size:2.12rem;border-bottom:1px solid var(--line);padding-bottom:.35em}
+article>h1:first-of-type{margin-top:.25em;font-size:2.48rem}
+h2{margin:1.7em 0 .55em;font-size:1.52rem}
+h3{margin:1.4em 0 .45em;font-size:1.16rem;color:var(--accent)}
+blockquote{margin:1.2em 0;padding:.85em 1.15em;border-left:4px solid var(--accent);background:color-mix(in srgb,var(--accent) 7%,transparent);color:var(--muted)}
+code{font-family:"Cascadia Code","SFMono-Regular",Consolas,monospace;font-size:.92em;background:color-mix(in srgb,var(--accent) 9%,transparent);padding:.12em .35em;border-radius:4px}
+pre{overflow:auto;padding:18px 20px;border-radius:10px;background:var(--code);color:var(--codeText);line-height:1.52}
+pre code{padding:0;background:none;color:inherit}
+table{width:100%;border-collapse:collapse;margin:1.3em 0;display:block;overflow:auto}
+th,td{border:1px solid var(--line);padding:9px 12px;text-align:left;vertical-align:top}
+th{background:color-mix(in srgb,var(--accent) 9%,transparent)}
+.callout{padding:14px 16px;border-radius:10px;margin:16px 0;border:1px solid}
+.note{background:var(--accentSoft);border-color:color-mix(in srgb,var(--accent) 30%,var(--line))}
+.good{background:var(--goodBg);border-color:color-mix(in srgb,var(--good) 35%,var(--line))}
+.warn{background:var(--warnBg);border-color:color-mix(in srgb,var(--warn) 35%,var(--line))}
+.bad{background:var(--badBg);border-color:color-mix(in srgb,var(--bad) 35%,var(--line))}
+.kicker{font-size:.8rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:700}
+a{color:var(--accent)}
+@media(max-width:980px){.layout{display:block;padding:14px}aside{position:relative;top:auto;height:auto;max-height:42vh;margin-bottom:14px}article{padding:26px 22px}article>h1:first-of-type{font-size:2rem}}
+@media print{body{background:white}.layout{display:block;padding:0}.layout aside{display:none}article{border:0;box-shadow:none;padding:0}pre{white-space:pre-wrap}}
+</style>
+</head>
+<body>
+<div class="layout">
+<aside><strong>目录</strong><nav id="toc"></nav></aside>
+<article>
+
+<div class="kicker">Claude Code · Transcript / Resume / Conversation Graph</div>
+<h1>Claude Code 的 Transcript 与会话恢复：从 JSONL 写入、Leaf 识别到有效分支重建</h1>
+
+<blockquote>
+<p><strong>核心结论：</strong>Claude Code 的 Transcript 不是普通聊天历史，也不是长期语义 Memory，而是一个按 Session 持久化的 <strong>append-only JSONL 会话事件日志</strong>。它保存的是“节点 + 父指针 + 运行元数据”，而不是直接保存“当前 Leaf”或“当前 Branch”。恢复时，Runtime 会重新构造 Conversation Graph，修复 Compact/Snip/Progress 等结构变化，再重新计算 Leaf，选出最新的 non-sidechain Leaf 作为主会话 tip，沿 <code>parentUuid</code> 反向追溯并补齐并行 Tool Result，最后经过协议清洗后重新注入新的 QueryEngine。</p>
+</blockquote>
+
+<h1>一、Transcript 是什么？</h1>
+
+<h2>1.1 定义</h2>
+<p>Transcript 可以理解为：</p>
+
+<pre><code>Session-scoped
+Append-only
+Durable
+Conversation / Execution Event Log
+</code></pre>
+
+<p>它记录一个 Agent Session 中真正发生过的、未来可能影响恢复的事实：</p>
+
+<ul>
+<li>User message</li>
+<li>Assistant message</li>
+<li><code>tool_use</code> / <code>tool_result</code></li>
+<li>System / Attachment</li>
+<li>Compact Boundary / Summary metadata</li>
+<li>部分 Session / Agent / Skill 状态</li>
+</ul>
+
+<h2>1.2 它不是什么？</h2>
+
+<table>
+<tr><th>机制</th><th>回答的问题</th></tr>
+<tr><td>Transcript</td><td>“这个 Session 发生过什么？”</td></tr>
+<tr><td>Auto Memory</td><td>“以后哪些经验值得长期记住？”</td></tr>
+<tr><td>CLAUDE.md</td><td>“这个项目/用户要求 Claude 遵守什么？”</td></tr>
+<tr><td>SessionMemory</td><td>“当前长任务已经进行到哪里？”</td></tr>
+</table>
+
+<div class="note callout"><strong>因此：</strong>Transcript 是恢复性记忆，而不是长期语义记忆。</div>
+
+<h1>二、为什么使用 JSONL，而不是一个大 JSON？</h1>
+
+<p>Transcript 采用类似：</p>
+
+<pre><code>session-id.jsonl
+
+entry 1
+entry 2
+entry 3
+entry 4
+...
+</code></pre>
+
+<p>而不是：</p>
+
+<pre><code>{
+  "messages": [...]
+}
+</code></pre>
+
+<p>这种 append-only 结构的直接收益：</p>
+
+<ul>
+<li>每产生一条新状态就能追加，不需要重写完整 Session。</li>
+<li>进程异常退出时，已经写入的前半段仍然有效。</li>
+<li>长时间 Tool Loop 下写入成本低。</li>
+<li>适合增量同步、Resume 与 Remote Bridge。</li>
+<li>天然保留历史分支，而不是覆盖旧状态。</li>
+</ul>
+
+<p>设计思想接近简化版 Event Sourcing：</p>
+
+<pre><code>Runtime State
+   ↓
+Append Durable Event
+   ↓
+Process Exit
+   ↓
+Replay / Rebuild
+</code></pre>
+
+<h1>三、运行时是怎样写 Transcript 的？</h1>
+
+<h2>3.1 User Message 先落盘，再进入 Claude API</h2>
+
+<p>Claude Code 有一个非常重要的可靠性顺序：</p>
+
+<pre><code>User submit
+   ↓
+processUserInput()
+   ↓
+mutableMessages.push(...)
+   ↓
+recordTranscript(...)
+   ↓
+Claude API
+</code></pre>
+
+<p>而不是：</p>
+
+<pre><code>User
+ ↓
+Claude API
+ ↓
+等待 Assistant
+ ↓
+最后才写 Transcript
+</code></pre>
+
+<p>这样即使 API 首个响应前进程 crash / Ctrl+C，刚刚提交的用户请求已经成为 durable state。</p>
+
+<h2>3.2 Tool Loop 也持续追加</h2>
+
+<pre><code>User
+ ↓
+Assistant: tool_use Read
+ ↓
+tool_result
+ ↓
+Assistant: tool_use Edit
+ ↓
+tool_result
+ ↓
+Assistant: tool_use Bash
+ ↓
+tool_result
+ ↓
+Assistant final
+</code></pre>
+
+<p>这些影响后续 Agent Context 的事件都会持续写入 Transcript。</p>
+
+<h1>四、JSONL 里到底怎么表示 Conversation？</h1>
+
+<h2>4.1 核心不是数组顺序，而是 <code>uuid + parentUuid</code></h2>
+
+<p>一条 Conversation Message 概念上类似：</p>
+
+<pre><code>{
+  type: "assistant",
+  uuid: "A2",
+  parentUuid: "U2",
+  timestamp: "...",
+  isSidechain: false,
+  ...
+}
+</code></pre>
+
+<p>所以真正保存的是：</p>
+
+<pre><code>uuid       = node identity
+parentUuid = edge to parent
+</code></pre>
+
+<p>而不是：</p>
+
+<pre><code>branchId
+leaf=true
+currentBranch=...
+</code></pre>
+
+<h2>4.2 正常线性对话</h2>
+
+<pre><code>U1
+ ↓
+A1
+ ↓
+U2
+ ↓
+A2
+</code></pre>
+
+<p>JSONL 近似：</p>
+
+<pre><code>U1 parent=null
+A1 parent=U1
+U2 parent=A1
+A2 parent=U2
+</code></pre>
+
+<h2>4.3 Fork 如何自然产生？</h2>
+
+<p>当用户 rewind 后从旧节点重新继续：</p>
+
+<pre><code>        U2 → A2
+       /
+U1 → A1
+       \
+        U3 → A3
+</code></pre>
+
+<p>JSONL 只需让两个新节点拥有同一个 parent：</p>
+
+<pre><code>U2.parentUuid = A1
+U3.parentUuid = A1
+</code></pre>
+
+<p>因此 Branch 是从 Graph 拓扑中自然推导出来的，不需要单独 Branch Table。</p>
+
+<h1>五、为什么 JSONL 行顺序不能直接当 Conversation 顺序？</h1>
+
+<p>假设写入顺序：</p>
+
+<pre><code>1 U1
+2 A1
+3 U2
+4 A2
+5 U3
+6 A3
+</code></pre>
+
+<p>如果只按文件顺序读取，会误以为：</p>
+
+<pre><code>U1 → A1 → U2 → A2 → U3 → A3
+</code></pre>
+
+<p>但真实 Graph 是：</p>
+
+<pre><code>            U2 → A2
+           /
+U1 → A1
+           \
+            U3 → A3
+</code></pre>
+
+<p>因此恢复必须基于 <code>parentUuid</code>，而不是 line number。</p>
+
+<h1>六、Leaf 是怎么存的？答案是：根本不直接存</h1>
+
+<blockquote>
+<p><strong>Leaf 是恢复时重新计算出来的。</strong></p>
+</blockquote>
+
+<p>定义：</p>
+
+<pre><code>Leaf
+=
+没有被任何其他 Message 的 parentUuid 指向的节点
+</code></pre>
+
+<p>例如：</p>
+
+<pre><code>            U2 → A2
+           /
+U1 → A1
+           \
+            U3 → A3
+</code></pre>
+
+<p>全部节点：</p>
+
+<pre><code>{U1, A1, U2, A2, U3, A3}
+</code></pre>
+
+<p>被作为 parent 引用的节点：</p>
+
+<pre><code>{U1, A1, U2, U3}
+</code></pre>
+
+<p>所以：</p>
+
+<pre><code>leafs = allNodes - referencedParents
+
+      = {A2, A3}
+</code></pre>
+
+<h1>七、为什么不能 Parse 完 JSONL 后马上计算 Leaf？</h1>
+
+<p>因为磁盘上的原始 Graph 可能经过：</p>
+
+<ul>
+<li>Compact</li>
+<li>Snip</li>
+<li>Preserved Segment</li>
+<li>旧版 Progress 节点</li>
+<li>Context Collapse</li>
+</ul>
+
+<p>这些操作可能导致某些 <code>parentUuid</code> 需要逻辑修复。</p>
+
+<p>恢复流程更接近：</p>
+
+<pre><code>parse JSONL
+    ↓
+Map&lt;UUID, Message&gt;
+    ↓
+legacy progress bridging
+    ↓
+applyPreservedSegmentRelinks()
+    ↓
+applySnipRemovals()
+    ↓
+recomputeLeaves()
+</code></pre>
+
+<h2>7.1 Snip 为什么需要 Relink？</h2>
+
+<p>原来：</p>
+
+<pre><code>A → B → C → D
+</code></pre>
+
+<p>Snip 删除 B、C 后，如果什么都不做：</p>
+
+<pre><code>D.parentUuid = C
+但 C 已不存在
+</code></pre>
+
+<p>链就断了。</p>
+
+<p>所以恢复时需要：</p>
+
+<pre><code>D
+ ↓
+C deleted
+ ↓
+B deleted
+ ↓
+A survives
+</code></pre>
+
+<p>最后改成：</p>
+
+<pre><code>D.parentUuid = A
+</code></pre>
+
+<p>之后再计算 Leaf。</p>
+
+<h1>八、多个 Leaf 时，怎样识别主会话的有效分支？</h1>
+
+<p>核心策略分三步：</p>
+
+<h2>8.1 第一步：必须是真 Leaf</h2>
+
+<pre><code>leafUuids.has(message.uuid)
+</code></pre>
+
+<p>不是 leaf 的节点即使 timestamp 新，也不能作为当前 branch tip。</p>
+
+<h2>8.2 第二步：排除 Sidechain</h2>
+
+<pre><code>if (message.isSidechain)
+    continue
+</code></pre>
+
+<p>Subagent / sidechain 可能拥有自己的最新 Leaf，但不应被当成主 Conversation。</p>
+
+<h2>8.3 第三步：剩余 Main Leafs 中选 timestamp 最新的</h2>
+
+<pre><code>for each message:
+    if is leaf
+       and !isSidechain
+       and timestamp > currentTipTimestamp
+    then:
+       tip = message
+</code></pre>
+
+<p>因此当前主分支 tip 的基本定义是：</p>
+
+<blockquote><strong>Newest non-sidechain leaf</strong></blockquote>
+
+<h1>九、用完整 Fork 示例看有效分支选择</h1>
+
+<p>JSONL：</p>
+
+<pre><code>U1  parent=null   10:00
+A1  parent=U1     10:01
+
+U2  parent=A1     10:02
+A2  parent=U2     10:03
+
+U3  parent=A1     10:10
+A3  parent=U3     10:11
+</code></pre>
+
+<p>Graph：</p>
+
+<pre><code>            U2 → A2  (leaf, 10:03)
+           /
+U1 → A1
+           \
+            U3 → A3  (leaf, 10:11)
+</code></pre>
+
+<p>候选：</p>
+
+<pre><code>A2
+A3
+</code></pre>
+
+<p>两者都不是 sidechain，因此比较时间：</p>
+
+<pre><code>A2 = 10:03
+A3 = 10:11
+</code></pre>
+
+<p>最终：</p>
+
+<pre><code>tip = A3
+</code></pre>
+
+<p>旧分支：</p>
+
+<pre><code>U2 → A2
+</code></pre>
+
+<p>仍然保留在 JSONL，但不属于当前恢复的主链。</p>
+
+<h1>十、选出 Tip 后怎么重建 Conversation Chain？</h1>
+
+<p>核心思想：</p>
+
+<pre><code>tip
+ ↓
+parentUuid
+ ↓
+parentUuid
+ ↓
+...
+ ↓
+root
+</code></pre>
+
+<p>例如：</p>
+
+<pre><code>A3.parentUuid = U3
+U3.parentUuid = A1
+A1.parentUuid = U1
+U1.parentUuid = null
+</code></pre>
+
+<p>先得到：</p>
+
+<pre><code>A3
+U3
+A1
+U1
+</code></pre>
+
+<p>最后 reverse：</p>
+
+<pre><code>U1
+ ↓
+A1
+ ↓
+U3
+ ↓
+A3
+</code></pre>
+
+<p>这就是当前主 Conversation Chain。</p>
+
+<h1>十一、为什么 Parent Walk 还不够？并行 Tool Call 的特殊问题</h1>
+
+<p>Claude 可能一次生成多个：</p>
+
+<pre><code>tool_use Read A
+tool_use Read B
+tool_use Grep C
+</code></pre>
+
+<p>Streaming / Tool Result 落盘后，多个 sibling 结果可能不全部位于同一条简单 parent 链中。</p>
+
+<p>因此：</p>
+
+<pre><code>buildConversationChain()
+    ↓
+parentUuid backward walk
+    ↓
+reverse
+    ↓
+recoverOrphanedParallelToolResults(...)
+</code></pre>
+
+<p>恢复器还需要补回在 parallel tool use 场景中可能遗漏的 sibling Tool Result。</p>
+
+<div class="note callout"><strong>所以：</strong>Conversation Recovery 不是单纯的 linked-list traversal，而是“主链回溯 + 并行 Tool sibling 修补”。</div>
+
+<h1>十二、为什么有效 Branch 还不一定能直接发给 Claude API？</h1>
+
+<p>Graph 上合法，不等于 Protocol 上合法。</p>
+
+<p>可能存在：</p>
+
+<ul>
+<li>未完成的 <code>tool_use</code></li>
+<li>孤立 <code>thinking</code></li>
+<li>空 assistant message</li>
+<li>中断在 Tool Call 中间的 Turn</li>
+</ul>
+
+<p>因此恢复还需要：</p>
+
+<pre><code>Graph-valid chain
+    ↓
+deserializeMessages()
+    ↓
+filter unresolved tool_use
+    ↓
+filter orphan thinking
+    ↓
+repair interrupted turn
+    ↓
+Runtime-valid Messages
+</code></pre>
+
+<p>最终才可以重新进入 QueryEngine / Claude API。</p>
+
+<h1>十三、ToolUse / ToolResult 为什么是恢复不变量？</h1>
+
+<p>Claude Messages API 需要：</p>
+
+<pre><code>tool_use.id
+      ↕
+tool_result.tool_use_id
+</code></pre>
+
+<p>如果 Transcript 停在：</p>
+
+<pre><code>Assistant:
+tool_use id=toolu_123
+
+CRASH
+</code></pre>
+
+<p>那么直接 Resume 会形成非法对话。</p>
+
+<p>因此恢复器必须识别：</p>
+
+<pre><code>unresolved tool_use
+```
+
+并做过滤/修复，保证重新注入模型时协议成立。</p>
+
+<h1>十四、Compact 与 Transcript 的关系</h1>
+
+<h2>14.1 RAM 和 Durable History 是两套状态</h2>
+
+<p>Compact 前：</p>
+
+<pre><code>QueryEngine.mutableMessages
+=
+大量原始历史
+</code></pre>
+
+<p>Compact 后：</p>
+
+<pre><code>QueryEngine.mutableMessages
+=
+summary / compact boundary 后 active messages
+</code></pre>
+
+<p>但 Transcript 仍可保留：</p>
+
+<pre><code>旧 durable history
++
+compact metadata
++
+new history
+</code></pre>
+
+<p>所以：</p>
+
+<pre><code>Transcript
+= Durable full/session history
+
+mutableMessages
+= Active working context
+</code></pre>
+
+<h2>14.2 Resume 时为什么要识别最新 Compact Boundary？</h2>
+
+<p>超长 Transcript 不必完整恢复到 Active Context。Loader 可以优先定位最新 Compact Boundary，从那里恢复当前有效上下文，同时单独扫描边界前仍需要的 Session Metadata。</p>
+
+<h1>十五、Progress / Legacy Entry 为什么也会影响 Leaf？</h1>
+
+<p>旧版结构中，某些真实消息的 <code>parentUuid</code> 可能曾经指向 Progress Entry。</p>
+
+<p>但 Progress 并不是 durable conversation node。</p>
+
+<p>所以恢复时需要类似：</p>
+
+<pre><code>Real Message
+    ↓
+parent = old progress node
+    ↓
+progress bridge
+    ↓
+real parent
+</code></pre>
+
+<p>否则主链会在历史 Progress 节点处断掉。</p>
+
+<h1>十六、Subagent / Sidechain 怎么避免污染主会话？</h1>
+
+<p>Claude Code 通常还会在物理存储上把主 Session 与 Subagent Sidechain 分开：</p>
+
+<pre><code>session-id.jsonl
+
+session-id/
+└─ subagents/
+   ├─ agent-A.jsonl
+   └─ agent-B.jsonl
+</code></pre>
+
+<p>逻辑上又有：</p>
+
+<pre><code>isSidechain
+</code></pre>
+
+<p>因此是两层保护：</p>
+
+<pre><code>Storage namespace isolation
+        +
+Logical sidechain filtering
+</code></pre>
+
+<p>这样 Resume 主 Session 时不会因为某个 Subagent 时间戳更新就错误选择它的 Leaf。</p>
+
+<h1>十七、Transcript 与 FileHistory 为什么必须一起看？</h1>
+
+<p>Transcript 只解决 Conversation State。</p>
+
+<p>假设：</p>
+
+<pre><code>Turn 1: 改 a.ts
+Turn 2: 改 b.ts
+Turn 3: 改 c.ts
+</code></pre>
+
+<p>如果用户 rewind 到 Turn 1，仅恢复 Transcript：</p>
+
+<pre><code>Claude 认知：
+只改过 a.ts
+
+真实磁盘：
+a.ts
+b.ts
+c.ts
+都已经修改
+</code></pre>
+
+<p>于是：</p>
+
+<pre><code>Cognitive State
+≠
+World State
+</code></pre>
+
+<p>所以：</p>
+
+<pre><code>Transcript
+= Conversation State Recovery
+
+FileHistory
+= Workspace State Recovery
+</code></pre>
+
+<p>真正的 Coding Agent Resume/rewind 需要二者配合。</p>
+
+<h1>十八、一次完整 /resume 流程</h1>
+
+<pre><code>/resume
+   ↓
+Session Discovery
+   ↓
+找到 session.jsonl
+   ↓
+readTranscriptForLoad()
+   ↓
+parse JSONL
+   ↓
+Map&lt;UUID, Message&gt;
+   ↓
+修复：
+  ├─ progress bridge
+  ├─ preserved segment
+  └─ snip relink
+   ↓
+recompute leafUuids
+   ↓
+过滤 sidechain
+   ↓
+选择 newest non-sidechain leaf
+   ↓
+tip
+   ↓
+buildConversationChain()
+   ↓
+parentUuid backward walk
+   ↓
+reverse
+   ↓
+recover parallel tool results
+   ↓
+Graph-valid conversation
+   ↓
+deserializeMessages()
+   ├─ unresolved tool_use repair
+   ├─ orphan thinking filter
+   └─ interrupted turn repair
+   ↓
+restore:
+   ├─ session metadata
+   ├─ invoked skills
+   ├─ file history
+   ├─ compact/context-collapse state
+   └─ worktree / agent metadata
+   ↓
+initialMessages
+   ↓
+new QueryEngine
+   ↓
+继续 Conversation
+</code></pre>
+
+<h1>十九、为什么 Transcript 不直接存 Current Branch / Leaf？</h1>
+
+<p>这种设计有几个明显好处：</p>
+
+<ul>
+<li>Append-only，不需要回头修改旧记录。</li>
+<li>Fork / rewind 不会破坏旧分支。</li>
+<li>恢复逻辑可以兼容 Compact、Snip、Legacy Progress 等结构变化。</li>
+<li>旧分支保留，未来可以审计、恢复或做分支选择。</li>
+<li>避免“某次 branch pointer 写入失败”导致整个会话不可恢复。</li>
+</ul>
+
+<p>代价是：</p>
+
+<ul>
+<li>读取侧复杂度显著提高。</li>
+<li>必须重建 Graph。</li>
+<li>必须重新计算 Leaf。</li>
+<li>必须处理并行 Tool / Compact / Snip / Sidechain / Legacy migration。</li>
+</ul>
+
+<p>所以 Claude Code 的 Transcript 设计明显属于：</p>
+
+<blockquote><strong>Write path simple，Read/Recovery path sophisticated。</strong></blockquote>
+
+<h1>二十、最关键的源码理解</h1>
+
+<table>
+<tr><th>问题</th><th>答案</th></tr>
+<tr><td>Leaf 存在哪里？</td><td>不直接存；恢复时根据 Graph 重算。</td></tr>
+<tr><td>Branch 如何表示？</td><td>多个 Message 共享同一 <code>parentUuid</code>。</td></tr>
+<tr><td>当前主 Branch 怎么选？</td><td>从 Leaf 中排除 sidechain，通常选 timestamp 最新者。</td></tr>
+<tr><td>Branch 怎么重建？</td><td>从 tip 沿 <code>parentUuid</code> 反向走到 root，再 reverse。</td></tr>
+<tr><td>并行 Tool 怎么处理？</td><td>主链构建后补 sibling/orphaned parallel tool results。</td></tr>
+<tr><td>Compact/Snip 怎么处理？</td><td>先 relink/repair Graph，再 recompute leaf。</td></tr>
+<tr><td>恢复后能直接发 API 吗？</td><td>不能；还需协议级 sanitize。</td></tr>
+<tr><td>Workspace 怎么恢复？</td><td>配合 FileHistory，而不是只靠 Transcript。</td></tr>
+</table>
+
+<h1>二十一、整体架构图</h1>
+
+<pre><code>                Runtime Write Path
+────────────────────────────────────────────
+User / Assistant / Tool / System
+              ↓
+        recordTranscript()
+              ↓
+        session.jsonl
+              ↓
+    append-only durable log
+
+
+               Recovery Read Path
+────────────────────────────────────────────
+          session.jsonl
+              ↓
+         parse entries
+              ↓
+     Map&lt;UUID, Message&gt;
+              ↓
+       Graph Repair Phase
+       ├─ progress bridge
+       ├─ preserved relink
+       └─ snip relink
+              ↓
+       recomputeLeaves()
+              ↓
+      Candidate Main Leafs
+              ↓
+       !isSidechain
+              ↓
+ newest timestamp main leaf
+              ↓
+             tip
+              ↓
+   buildConversationChain()
+              ↓
+ parentUuid backward traversal
+              ↓
+            reverse
+              ↓
+recover parallel tool results
+              ↓
+     Graph-valid message chain
+              ↓
+      Protocol Sanitization
+              ↓
+     Runtime-valid messages
+              ↓
+        restore metadata
+              ↓
+      new QueryEngine
+              ↓
+      Resume Conversation
+</code></pre>
+
+<h1>二十二、与 Agent Harness 设计的关系</h1>
+
+<p>如果自己实现 Agent Harness，Claude Code 这套机制至少给出 5 个很强的工程启发：</p>
+
+<ol>
+<li><strong>Transcript 应保存 Durable Facts，不要序列化 Runtime Object。</strong></li>
+<li><strong>Append-only 写入比频繁覆盖 Session Snapshot 更抗 crash。</strong></li>
+<li><strong>分支关系用 Parent Pointer 表达，比单独维护 Branch Table 更自然。</strong></li>
+<li><strong>Active Branch 应从 Graph 推导，而不是依赖“最后一行”。</strong></li>
+<li><strong>恢复必须分成 Graph Repair → Branch Selection → Protocol Repair → Runtime Rehydration 四步。</strong></li>
+</ol>
+
+<h1>二十三、推荐源码阅读路径</h1>
+
+<ol>
+<li><code>src/QueryEngine.ts</code> —— Transcript 写入时机与 mutableMessages。</li>
+<li><code>src/utils/sessionStorage.ts</code> —— JSONL、Message Map、Leaf 重算。</li>
+<li><code>src/utils/sessionStoragePortable.ts</code> —— 大 Transcript / Compact Boundary 加载。</li>
+<li><code>src/utils/conversationRecovery.ts</code> —— Resume、Leaf 选择、协议清洗。</li>
+<li><code>src/utils/fileHistory.ts</code> —— Workspace Recovery。</li>
+<li><code>src/services/compact/</code> —— Compact 与 Durable History 的关系。</li>
+</ol>
+
+<h1>二十四、一句话总结</h1>
+
+<blockquote>
+<p><strong>Claude Code 的 Transcript 是一个按 Session 追加写入的 JSONL durable event log。它不直接存 Leaf 或 Active Branch，而是为每条 Conversation Message 保存 <code>uuid</code> 与 <code>parentUuid</code>，由多个节点共享同一个 parent 自然表达 Fork；恢复时先重建 Message Graph，并处理 Progress、Compact、Preserved Segment、Snip 等链路修复，再把“未被任何其他 Message 的 <code>parentUuid</code> 引用”的节点重新计算为 Leaf；多个 Leaf 中排除 <code>isSidechain</code>，通常选择 timestamp 最新的 non-sidechain Leaf 作为主 Conversation tip；随后从 tip 沿 <code>parentUuid</code> 反向追溯到 Root、reverse 成正向消息链，补齐并行 Tool Result，再过滤 unresolved tool_use、orphan thinking 和中断状态，最后把恢复出的合法 Messages、Session Metadata、Skill/FileHistory/Compact 状态重新注入新的 QueryEngine。它本质上是一套“append-only log + conversation graph reconstruction + runtime rehydration”的会话恢复机制。</strong></p>
+</blockquote>
+
+</article>
+</div>
+<script>
+const toc=document.getElementById('toc');
+const seen=new Map();
+const headings=[...document.querySelectorAll('article h1,article h2,article h3')];
+headings.forEach((h,i)=>{
+  const base=h.textContent.trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu,'-').replace(/^-|-$/g,'')||`section-${i+1}`;
+  const n=seen.get(base)||0;seen.set(base,n+1);h.id=n?`${base}-${n+1}`:base;
+  const a=document.createElement('a');a.href=`#${h.id}`;a.textContent=h.textContent;
+  if(h.tagName==='H2')a.className='sub';if(h.tagName==='H3')a.className='sub3';toc.appendChild(a);
+});
+const links=[...toc.querySelectorAll('a')];
+function active(){
+  let cur=headings[0];
+  for(const h of headings){if(h.getBoundingClientRect().top<=105)cur=h;else break}
+  links.forEach(a=>a.classList.toggle('active',a.getAttribute('href')===`#${cur.id}`));
+}
+addEventListener('scroll',active,{passive:true});
+addEventListener('resize',active);
+active();
+</script>
+</body>
+</html>

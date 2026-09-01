@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Code Tool Runtime：Concurrency Orchestration 源码与工作机制</title>
+<style>
+:root{
+  --bg:#f7f8fb;--panel:#fff;--text:#1f2937;--muted:#6b7280;--border:#e5e7eb;
+  --accent:#2563eb;--accent-soft:#eff6ff;--good:#065f46;--good-bg:#ecfdf5;
+  --warn:#92400e;--warn-bg:#fffbeb;--code:#111827;--code-text:#f9fafb;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;background:var(--bg);color:var(--text);line-height:1.75;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;
+}
+.container{max-width:1120px;margin:0 auto;padding:40px 24px 72px}
+.hero,.card{
+  background:var(--panel);border:1px solid var(--border);border-radius:18px;
+  box-shadow:0 8px 28px rgba(15,23,42,.045);
+}
+.hero{padding:34px 38px;background:linear-gradient(135deg,#fff 0%,#f3f6ff 100%);margin-bottom:24px}
+.card{padding:26px 30px;margin-top:20px}
+h1{font-size:34px;line-height:1.28;margin:0 0 14px}
+h2{font-size:25px;margin:36px 0 12px;border-left:5px solid var(--accent);padding-left:12px}
+h3{font-size:19px;margin:24px 0 8px}
+p{margin:10px 0}.lead{font-size:18px;color:#374151}.small{font-size:14px;color:var(--muted)}
+.note,.tip,.warn{border-radius:11px;padding:14px 17px;margin:16px 0}
+.note{background:var(--accent-soft);border:1px solid #bfdbfe;font-weight:600}
+.tip{background:var(--good-bg);border:1px solid #a7f3d0;color:var(--good);font-weight:600}
+.warn{background:var(--warn-bg);border:1px solid #fde68a;color:var(--warn)}
+pre{
+  background:var(--code);color:var(--code-text);padding:18px 20px;border-radius:12px;
+  overflow-x:auto;line-height:1.55;font-size:14px
+}
+code{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace}
+p code,li code,td code{
+  background:#f3f4f6;padding:2px 6px;border-radius:5px;font-size:.95em
+}
+table{width:100%;border-collapse:collapse;margin:18px 0;font-size:15px}
+th,td{border:1px solid var(--border);padding:12px 14px;text-align:left;vertical-align:top}
+th{background:#f9fafb}
+ul{padding-left:24px}li{margin:5px 0}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+.kicker{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:700}
+.footer{margin-top:34px;text-align:center;color:var(--muted);font-size:13px}
+</style>
+</head>
+<body>
+<div class="container">
+
+<section class="hero">
+  <div class="kicker">Claude Code Tool Runtime</div>
+  <h1>Concurrency Orchestration：源码在哪里，它是怎么工作的？</h1>
+  <p class="lead">
+    本文基于 BennettBin/Claude-code 恢复源码，系统梳理 Claude Code Tool Runtime 中的并发编排机制，
+    包括传统 Batch Tool Orchestration 与 Streaming Tool Execution 两套路径，以及
+    <code>isConcurrencySafe()</code>、<code>partitionToolCalls()</code>、
+    <code>runToolsConcurrently()</code>、<code>StreamingToolExecutor</code> 等核心实现。
+  </p>
+  <div class="note">
+    核心结论：Claude Code 不是简单把所有 Tool Call 用 <code>Promise.all()</code> 并行执行，而是先对每次调用做运行时并发安全判断，再通过 batch、barrier、队列和独占执行机制维持语义正确性。
+  </div>
+  <p class="small">
+    注意：BennettBin/Claude-code 并非 Anthropic 官方开源仓库，而是根据公开发布物与 source map 恢复出的 TypeScript 源码树。
+  </p>
+</section>
+
+<section class="card">
+<h2>1. Concurrency Orchestration 的核心源码位置</h2>
+<p>传统 Tool 并发编排主要集中在：</p>
+<pre><code>src/services/tools/toolOrchestration.ts</code></pre>
+
+<p>最值得看的函数包括：</p>
+<pre><code>runTools()
+partitionToolCalls()
+runToolsConcurrently()
+runToolsSerially()
+getMaxToolUseConcurrency()</code></pre>
+
+<p>另外，每个 Tool 是否允许并发的基础接口位于：</p>
+<pre><code>src/Tool.ts</code></pre>
+
+<p>而 Streaming Tool Execution 主要位于：</p>
+<pre><code>src/services/tools/StreamingToolExecutor.ts
+src/query.ts</code></pre>
+
+<div class="tip">
+可以把整个机制分成两层：<strong>Tool 自己声明并发安全性</strong>，Tool Runtime 根据这个声明完成<strong>调度与执行</strong>。
+</div>
+</section>
+
+<section class="card">
+<h2>2. 第一步：每个 Tool 自己声明是否可以并发</h2>
+<p>Claude Code 并不是根据 Tool 名字硬编码判断是否并发，而是调用：</p>
+<pre><code>tool.isConcurrencySafe(input)</code></pre>
+
+<p>这意味着并发安全是 Tool abstraction 的一部分。更重要的是，它是一个<strong>按调用参数动态判断</strong>的接口。</p>
+
+<p>Tool 层还采用了 fail-closed 默认值：</p>
+<pre><code>isConcurrencySafe: (_input?: unknown) =&gt; false
+isReadOnly:        (_input?: unknown) =&gt; false</code></pre>
+
+<p>含义是：</p>
+<div class="warn">
+如果一个新 Tool 没有明确声明自己可以并发，那么默认按“不安全、不可并发”处理。
+</div>
+
+<p>这是一种典型的安全系统设计：无法证明安全时，不默认放行。</p>
+</section>
+
+<section class="card">
+<h2>3. 为什么不是简单地用 isReadOnly 判断？</h2>
+<p>很多人会把并发调度简单理解成：</p>
+<pre><code>Read  → 并发
+Write → 串行</code></pre>
+
+<p>但源码真正使用的是：</p>
+<pre><code>isConcurrencySafe(input)</code></pre>
+
+<p>而不是：</p>
+<pre><code>isReadOnly(input)</code></pre>
+
+<p>两者概念相关，但不是同一个东西。因为同一个 Tool 在不同参数下，副作用可能不同。</p>
+
+<p>例如 Bash：</p>
+<pre><code>Bash("ls")
+Bash("rm file")</code></pre>
+
+<p>都是 <code>BashTool</code>，但对系统状态的影响完全不同。因此一个成熟 Agent Harness 更适合做：</p>
+<pre><code>ToolCall-level concurrency classification</code></pre>
+
+<p>而不只是：</p>
+<pre><code>Tool-level static metadata</code></pre>
+</section>
+
+<section class="card">
+<h2>4. partitionToolCalls()：传统批处理并发的核心算法</h2>
+<p><code>partitionToolCalls()</code> 的主要职责，是按原始 Tool Call 顺序，将连续的 concurrency-safe 调用合并为并发 batch。</p>
+
+<p>简化后的逻辑如下：</p>
+<pre><code>for each toolUse:
+    找到对应 Tool
+
+    使用 inputSchema 解析 input
+
+    safe = tool.isConcurrencySafe(input)
+
+    if safe
+       and 上一个 batch 也是 safe:
+           追加到上一个 batch
+    else:
+           新建 batch</code></pre>
+
+<p>更接近源码意图的关键逻辑：</p>
+<pre><code>const tool =
+    findToolByName(toolUseContext.options.tools, toolUse.name)
+
+const parsedInput =
+    tool?.inputSchema.safeParse(toolUse.input)
+
+const isConcurrencySafe =
+    parsedInput?.success
+        ? tool.isConcurrencySafe(parsedInput.data)
+        : false</code></pre>
+
+<p>这里有两个重要防御策略：</p>
+<ul>
+  <li>如果 <code>inputSchema.safeParse()</code> 失败，默认认为不可并发。</li>
+  <li>如果 <code>isConcurrencySafe()</code> 内部发生异常，也按不可并发处理。</li>
+</ul>
+
+<div class="tip">
+核心原则：<strong>无法证明 safe，就按 unsafe 处理。</strong>
+</div>
+</section>
+
+<section class="card">
+<h2>5. 为什么只合并“连续的”并发安全 Tool？</h2>
+<p>假设模型一次返回：</p>
+<pre><code>1. Read A
+2. Read B
+3. Grep C
+4. Edit D
+5. Read E</code></pre>
+
+<p>若：</p>
+<pre><code>Read  → safe
+Grep  → safe
+Edit  → unsafe</code></pre>
+
+<p>那么会被分组为：</p>
+<pre><code>Batch 1
+┌───────────┐
+│ Read A    │
+│ Read B    │
+│ Grep C    │
+└───────────┘
+concurrent
+
+Batch 2
+┌───────────┐
+│ Edit D    │
+└───────────┘
+serial
+
+Batch 3
+┌───────────┐
+│ Read E    │
+└───────────┘
+concurrent</code></pre>
+
+<p>非常重要的一点是，Claude Code 不会把所有 Read 全部“抽出来”放到一起执行。</p>
+
+<p>比如：</p>
+<pre><code>Read A
+Edit B
+Read C</code></pre>
+
+<p>不会被重排为：</p>
+<pre><code>Read A + Read C
+Edit B</code></pre>
+
+<p>而是保持：</p>
+<pre><code>Read A
+   ↓
+Edit B
+   ↓
+Read C</code></pre>
+
+<p>这是为了保持模型生成 Tool Call 时的原始执行语义，避免跨越 mutation 操作导致读取错误状态。</p>
+</section>
+
+<section class="card">
+<h2>6. runTools()：决定并发还是串行执行</h2>
+<p>在 batch 分组之后，<code>runTools()</code> 会根据每个 batch 的并发安全标记选择执行方式：</p>
+
+<pre><code>for (batch of partitionToolCalls(...)) {
+
+    if (batch.isConcurrencySafe) {
+        runToolsConcurrently(...)
+    } else {
+        runToolsSerially(...)
+    }
+}</code></pre>
+
+<p>可以抽象成：</p>
+<pre><code>                    partitionToolCalls()
+                           │
+                ┌──────────┴──────────┐
+                │                     │
+            safe=true             safe=false
+                │                     │
+                ▼                     ▼
+   runToolsConcurrently()     runToolsSerially()</code></pre>
+
+<p>也就是说，<code>partitionToolCalls()</code> 负责分类，<code>runTools()</code> 负责调度。</p>
+</section>
+
+<section class="card">
+<h2>7. runToolsConcurrently()：不是简单 Promise.all()</h2>
+<p>并发执行时，源码不是简单：</p>
+<pre><code>Promise.all(...)</code></pre>
+
+<p>而是使用支持 AsyncGenerator 的并发执行器，大致行为可以理解为：</p>
+<pre><code>yield* all(
+    toolUseMessages.map(async function* (toolUse) {
+
+        setInProgress(toolUse.id)
+
+        yield* runToolUse(...)
+
+        markToolUseAsComplete(...)
+
+    }),
+
+    getMaxToolUseConcurrency()
+)</code></pre>
+
+<p>这里每个 Tool 最终仍然走统一执行入口：</p>
+<pre><code>runToolUse()</code></pre>
+
+<p>区别只是多个 <code>runToolUse()</code> 会由并发调度器同时驱动。</p>
+
+<pre><code>runTools()
+   │
+   ▼
+partitionToolCalls()
+   │
+   ├── concurrent batch
+   │       │
+   │       ▼
+   │ runToolsConcurrently()
+   │       ├── runToolUse(A)
+   │       ├── runToolUse(B)
+   │       └── runToolUse(C)
+   │
+   └── serial batch
+           │
+           ▼
+     runToolsSerially()
+           │
+           ▼
+       runToolUse(D)</code></pre>
+</section>
+
+<section class="card">
+<h2>8. 最大并发数为什么默认是 10？</h2>
+<p>源码中存在：</p>
+<pre><code>function getMaxToolUseConcurrency(): number {
+    return (
+        parseInt(
+            process.env.CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY || '',
+            10,
+        ) || 10
+    )
+}</code></pre>
+
+<p>默认最大并发数：</p>
+<pre><code>10</code></pre>
+
+<p>并且可以通过环境变量调整：</p>
+<pre><code>CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY</code></pre>
+
+<p>这样做是为了避免一次产生大量 Tool Call 时占满：</p>
+<ul>
+  <li>文件句柄</li>
+  <li>本地进程</li>
+  <li>CPU / I/O</li>
+  <li>网络连接</li>
+  <li>MCP Server 请求能力</li>
+</ul>
+
+<p>所以即使模型一次生成 50 个安全的读取调用，也不会无上限地全部同时启动。</p>
+</section>
+
+<section class="card">
+<h2>9. runToolsSerially() 为什么要真正串行？</h2>
+<p>串行路径本质上是：</p>
+<pre><code>for (const toolUse of toolUseMessages) {
+
+    for await (const update of runToolUse(...)) {
+        ...
+    }
+
+}</code></pre>
+
+<p>也就是说：</p>
+<pre><code>Tool A 完全完成
+        ↓
+Tool B 才开始
+        ↓
+Tool B 完全完成
+        ↓
+Tool C 才开始</code></pre>
+
+<p>这对 mutation Tool 尤其重要。例如：</p>
+<pre><code>Edit file A
+↓
+Bash npm test</code></pre>
+
+<p>如果同时执行，测试可能读到尚未完成修改的文件。串行执行确保：</p>
+<pre><code>Edit
+████████████
+
+            npm test
+            ███████████</code></pre>
+
+<p>即形成明确的 happens-before 关系。</p>
+</section>
+
+<section class="card">
+<h2>10. contextModifier：为什么有些 Tool 必须形成 barrier</h2>
+<p>某些 Tool 执行后还可以返回：</p>
+<pre><code>contextModifier</code></pre>
+
+<p>用于改变后续 Tool 的执行上下文，例如：</p>
+<ul>
+  <li>cwd</li>
+  <li>环境变量</li>
+  <li>Permission state</li>
+  <li>Session state</li>
+  <li>Runtime context</li>
+</ul>
+
+<p>串行执行时，可以形成：</p>
+<pre><code>Tool A
+   │
+   ▼
+contextModifier
+   │
+   ▼
+newContext
+   │
+   ▼
+Tool B</code></pre>
+
+<p>如果 A、B 并发，B 可能已经在旧 context 下启动。因此这也是 Tool Runtime 必须维护顺序和 barrier 的原因之一。</p>
+</section>
+
+<section class="card">
+<h2>11. StreamingToolExecutor：更进一步的并发执行路径</h2>
+<p>除了传统 batch 模式，源码中还有更高级的 Streaming Tool Execution：</p>
+<pre><code>src/services/tools/StreamingToolExecutor.ts</code></pre>
+
+<p>它解决的问题是：</p>
+<div class="note">
+为什么一定要等 Claude 整个 response 流式输出完成，才开始执行已经完整生成的 Tool Call？
+</div>
+
+<p>传统模式：</p>
+<pre><code>Claude streaming
+████████████████████████
+
+                        Read A
+                        █████
+
+                             Read B
+                             █████</code></pre>
+
+<p>Streaming Tool Execution：</p>
+<pre><code>Claude streaming
+████████████████████████
+
+       Read A
+       █████
+
+           Read B
+           █████</code></pre>
+
+<p>也就是说，模型还在继续生成后面的内容时，前面已经完整生成的 Tool Call 可以提前启动。</p>
+</section>
+
+<section class="card">
+<h2>12. query.ts 如何接入 Streaming Tool Execution</h2>
+<p><code>query.ts</code> 中通过 feature gate 控制这一能力：</p>
+<pre><code>const useStreamingToolExecution =
+    config.gates.streamingToolExecution</code></pre>
+
+<p>开启后会创建：</p>
+<pre><code>new StreamingToolExecutor(...)</code></pre>
+
+<p>当模型流式输出过程中出现一个完整 <code>tool_use</code> block 时，会调用：</p>
+<pre><code>streamingToolExecutor.addTool(toolBlock, message)</code></pre>
+
+<p>所以在 Streaming 路径中，Agent Runtime 与 Tool Runtime 的连接点不是“整轮模型输出结束”，而是：</p>
+<pre><code>一个完整 tool_use block 出现
+        ↓
+立即进入 Tool Runtime</code></pre>
+</section>
+
+<section class="card">
+<h2>13. StreamingToolExecutor 内部的状态机</h2>
+<p>每个 Tool Call 会维护类似以下状态：</p>
+<pre><code>type ToolStatus =
+    | 'queued'
+    | 'executing'
+    | 'completed'
+    | 'yielded'</code></pre>
+
+<p>生命周期：</p>
+<pre><code>addTool()
+   │
+   ▼
+ queued
+   │
+   ▼
+executing
+   │
+   ▼
+completed
+   │
+   ▼
+ yielded</code></pre>
+
+<p>每个调用还会记录：</p>
+<pre><code>isConcurrencySafe
+promise
+results
+pendingProgress
+contextModifiers</code></pre>
+
+<p>因此这已经不是一个简单的批量执行函数，而是一个有状态 Tool Scheduler。</p>
+</section>
+
+<section class="card">
+<h2>14. canExecuteTool()：Streaming Scheduler 的核心判定</h2>
+<p>逻辑可以简化为：</p>
+
+<pre><code>private canExecuteTool(
+    isConcurrencySafe: boolean
+): boolean {
+
+    const executingTools =
+        当前正在运行的工具
+
+    return (
+        executingTools.length === 0
+        ||
+        (
+            isConcurrencySafe
+            &&
+            executingTools.every(
+                tool =&gt; tool.isConcurrencySafe
+            )
+        )
+    )
+}</code></pre>
+
+<p>它表达了四种情况：</p>
+
+<h3>情况 1：没有 Tool 正在执行</h3>
+<pre><code>executing = []</code></pre>
+<p>任何 Tool 都可以启动。</p>
+
+<h3>情况 2：当前全是 safe Tool，新 Tool 也 safe</h3>
+<pre><code>Read A running
+Read B arrives</code></pre>
+<p>允许并发：</p>
+<pre><code>Read A ███████████
+Read B    ███████████</code></pre>
+
+<h3>情况 3：safe Tool 正在跑，新 Tool unsafe</h3>
+<pre><code>Read A running
+Edit B arrives</code></pre>
+<p>Edit 必须等待：</p>
+<pre><code>Read A ███████████
+                   Edit B ███████</code></pre>
+
+<h3>情况 4：unsafe Tool 正在跑，新 Tool 即使 safe 也不能启动</h3>
+<pre><code>Edit A running
+Read B arrives</code></pre>
+
+<p>Read B 也必须等待。换句话说：</p>
+<div class="tip">Unsafe Tool 获得的是一种 exclusive access（独占执行权）。</div>
+</section>
+
+<section class="card">
+<h2>15. processQueue()：真正的 Streaming 调度器</h2>
+<p><code>processQueue()</code> 会不断检查 queued Tool：</p>
+<pre><code>遍历 queued tools
+       │
+       ▼
+canExecuteTool() ?
+       │
+   ┌───┴────┐
+   │        │
+ yes       no
+   │        │
+execute    如果前面是 unsafe Tool
+           则停止继续向后调度</code></pre>
+
+<p>这一步非常关键，因为它不仅判断“某个 Tool 本身能否并发”，还要维护原始 Tool 顺序。</p>
+
+<p>例如：</p>
+<pre><code>Read A
+Edit B
+Read C</code></pre>
+
+<p>即使 Read C 是 safe，也不能越过正在等待的 Edit B。否则模型原本设计的执行语义会被破坏。</p>
+</section>
+
+<section class="card">
+<h2>16. Unsafe Tool 可以理解成 Concurrency Barrier</h2>
+<p>假设流式输出顺序是：</p>
+<pre><code>Read A
+Read B
+Edit C
+Read D
+Read E</code></pre>
+
+<p>那么执行波次大致是：</p>
+<pre><code>Read A   ██████████
+Read B      ██████████
+
+                   Edit C ███████
+
+                          Read D ███████
+                          Read E    ███████</code></pre>
+
+<p>可以抽象成：</p>
+<pre><code>Read wave
+   ↓
+Write / Unsafe barrier
+   ↓
+Read wave</code></pre>
+
+<div class="tip">
+把 unsafe Tool 理解为 Concurrency Barrier，是理解 Claude Code Tool Runtime 并发机制最直观的方法之一。
+</div>
+</section>
+
+<section class="card">
+<h2>17. Streaming 模式还有 sibling cancellation</h2>
+<p><code>StreamingToolExecutor</code> 中还存在：</p>
+<pre><code>siblingAbortController</code></pre>
+
+<p>如果某个并行执行的 Bash Tool 发生错误，调度器可以取消某些仍在运行的 sibling subprocess。</p>
+
+<p>这是因为 Shell 命令往往存在隐式依赖。例如：</p>
+<pre><code>mkdir build
+cp file build/
+run build/task</code></pre>
+
+<p>如果前面的关键命令失败，后面的 sibling command 继续执行可能已经没有意义。</p>
+
+<p>而对 Read / WebFetch 这种通常相互独立的读取类 Tool，单个失败并不一定需要取消其他 sibling。</p>
+
+<p>因此 Streaming Tool Runtime 实际上已经具有：</p>
+<pre><code>Concurrency-aware
++
+Dependency-aware
++
+Abort-aware
+Tool Scheduler</code></pre>
+</section>
+
+<section class="card">
+<h2>18. 完整调用链</h2>
+<pre><code>                    Agent Runtime
+                         │
+                         │ Claude streaming
+                         ▼
+                     tool_use
+                         │
+                         ▼
+              ┌───────────────────────┐
+              │ Tool Runtime          │
+              │                       │
+              │ findToolByName()      │
+              │        ↓              │
+              │ inputSchema.safeParse │
+              │        ↓              │
+              │ isConcurrencySafe()   │
+              └──────────┬────────────┘
+                         │
+             ┌───────────┴───────────┐
+             │                       │
+            safe                   unsafe
+             │                       │
+             ▼                       ▼
+        parallel pool          exclusive barrier
+             │                       │
+             └───────────┬───────────┘
+                         ▼
+                    runToolUse()
+                         │
+                         ▼
+                    tool_result
+                         │
+                         ▼
+                    Agent Runtime</code></pre>
+
+<p>传统路径可以概括为：</p>
+<pre><code>Tool.ts
+   │
+   └── isConcurrencySafe()
+          ↓
+toolOrchestration.ts
+   │
+   ├── partitionToolCalls()
+   ├── runTools()
+   ├── runToolsConcurrently()
+   └── runToolsSerially()
+          ↓
+toolExecution.ts
+   │
+   └── runToolUse()</code></pre>
+
+<p>Streaming 路径则是：</p>
+<pre><code>query.ts
+   │
+   ▼
+StreamingToolExecutor
+   │
+   ├── addTool()
+   ├── canExecuteTool()
+   ├── processQueue()
+   ├── executeTool()
+   └── getCompletedResults()
+        │
+        ▼
+    runToolUse()</code></pre>
+</section>
+
+<section class="card">
+<h2>19. 这套设计的工程价值</h2>
+<table>
+<thead>
+<tr><th>设计点</th><th>解决的问题</th></tr>
+</thead>
+<tbody>
+<tr><td><code>isConcurrencySafe(input)</code></td><td>避免简单按 Tool 名字静态判断并发安全</td></tr>
+<tr><td>Fail-closed 默认值</td><td>新增 Tool 未配置时不意外并发</td></tr>
+<tr><td><code>partitionToolCalls()</code></td><td>在保持顺序语义的前提下形成并发 batch</td></tr>
+<tr><td><code>runToolsConcurrently()</code></td><td>并发执行安全 Tool，同时限制最大并发度</td></tr>
+<tr><td><code>runToolsSerially()</code></td><td>保护有副作用和有上下文依赖的 Tool</td></tr>
+<tr><td><code>contextModifier</code></td><td>允许前一个 Tool 修改后续 Tool 的运行上下文</td></tr>
+<tr><td><code>StreamingToolExecutor</code></td><td>降低“等待整轮模型输出结束后再执行”的延迟</td></tr>
+<tr><td>Unsafe barrier</td><td>为 mutation Tool 提供独占执行语义</td></tr>
+<tr><td>Sibling cancellation</td><td>减少隐式依赖链失败后的无效执行</td></tr>
+</tbody>
+</table>
+</section>
+
+<section class="card">
+<h2>20. 面试时可以怎样概括</h2>
+<div class="tip">
+Claude Code 的 Tool Runtime 并发机制并不是简单的只读并发、写操作串行。它先通过 <code>isConcurrencySafe(input)</code> 对每个 Tool Call 做运行时安全分类，然后由 Tool Runtime 保持原始调用顺序进行调度。传统路径通过 <code>partitionToolCalls()</code> 把连续的安全调用组成 batch，再分别走并发和串行执行；Streaming 路径则通过 <code>StreamingToolExecutor</code> 在模型仍然输出时提前启动完整的 Tool Call，并让 unsafe Tool 形成 execution barrier，从而兼顾吞吐、延迟和执行语义正确性。
+</div>
+</section>
+
+<section class="card">
+<h2>21. 参考源码</h2>
+<ul>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/Tool.ts">src/Tool.ts</a></li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/services/tools/toolOrchestration.ts">src/services/tools/toolOrchestration.ts</a></li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/services/tools/toolExecution.ts">src/services/tools/toolExecution.ts</a></li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/services/tools/StreamingToolExecutor.ts">src/services/tools/StreamingToolExecutor.ts</a></li>
+<li><a href="https://github.com/BennettBin/Claude-code/blob/main/src/query.ts">src/query.ts</a></li>
+</ul>
+</section>
+
+<div class="footer">Claude Code Tool Runtime / Concurrency Orchestration 架构笔记</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,1967 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="基于恢复源码的 Claude Code 五层架构深度解析">
+  <title>Claude Code 源码架构深度解析</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#f7f8fc; --panel:#fff; --text:#202431; --muted:#626b7a; --line:#dfe3ec; --accent:#6657d9; --code:#171923; --codeText:#e8eaf2; }
+    @media (prefers-color-scheme:dark) { :root { --bg:#11131a; --panel:#181b24; --text:#edf0f7; --muted:#abb2c0; --line:#303645; --accent:#a99cff; --code:#0c0e13; --codeText:#e8eaf2; } }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; }
+    body { margin:0; background:var(--bg); color:var(--text); font:16px/1.75 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+    .layout { width:min(1500px,100%); margin:auto; display:grid; grid-template-columns:300px minmax(0,960px); gap:32px; padding:28px 32px 48px; justify-content:center; align-items:start; }
+    aside { position:sticky; top:20px; height:calc(100vh - 40px); overflow:auto; padding:18px 16px 22px; background:var(--panel); border:1px solid var(--line); border-radius:14px; box-shadow:0 8px 26px rgba(20,25,40,.05); }
+    aside strong { display:block; margin-bottom:12px; padding:0 8px 10px; border-bottom:1px solid var(--line); font-size:16px; }
+    #toc { display:flex; flex-direction:column; gap:2px; }
+    #toc a { display:block; color:var(--muted); text-decoration:none; padding:6px 9px; font-size:13.5px; line-height:1.45; border-left:3px solid transparent; border-radius:6px; transition:.15s ease; }
+    #toc a.sub { padding-left:22px; font-size:13px; }
+    #toc a.sub3 { padding-left:34px; font-size:12.5px; }
+    #toc a:hover { color:var(--accent); background:color-mix(in srgb,var(--accent) 7%,transparent); }
+    #toc a.active { color:var(--accent); font-weight:650; border-left-color:var(--accent); background:color-mix(in srgb,var(--accent) 9%,transparent); }
+    article { min-width:0; padding:42px 52px; background:var(--panel); border:1px solid var(--line); border-radius:16px; box-shadow:0 12px 40px rgba(20,25,40,.07); }
+    h1,h2,h3 { line-height:1.3; scroll-margin-top:24px; }
+    h1 { margin:1.8em 0 .65em; font-size:2.15rem; border-bottom:1px solid var(--line); padding-bottom:.35em; }
+    article > h1:first-child { margin-top:0; font-size:2.6rem; }
+    h2 { margin:1.7em 0 .55em; font-size:1.55rem; }
+    h3 { margin:1.4em 0 .4em; font-size:1.15rem; color:var(--accent); }
+    p,li { color:var(--text); }
+    blockquote { margin:1.2em 0; padding:.8em 1.1em; border-left:4px solid var(--accent); background:color-mix(in srgb,var(--accent) 8%,transparent); color:var(--muted); }
+    code { font-family:"Cascadia Code","SFMono-Regular",Consolas,monospace; font-size:.92em; background:color-mix(in srgb,var(--accent) 10%,transparent); padding:.12em .35em; border-radius:4px; }
+    pre { overflow:auto; padding:18px 20px; border-radius:10px; background:var(--code); color:var(--codeText); line-height:1.55; }
+    pre code { padding:0; background:none; color:inherit; }
+    table { width:100%; border-collapse:collapse; margin:1.3em 0; display:block; overflow:auto; }
+    th,td { border:1px solid var(--line); padding:9px 12px; text-align:left; vertical-align:top; }
+    th { background:color-mix(in srgb,var(--accent) 10%,transparent); }
+    hr { border:0; border-top:1px solid var(--line); margin:2.5em 0; }
+    a { color:var(--accent); }
+    @media (max-width:980px) { .layout { display:block; padding:14px; } aside { position:relative; top:auto; height:auto; max-height:42vh; margin-bottom:14px; } article { padding:26px 22px; } article > h1:first-child { font-size:2rem; } }
+    @media print { body { background:#fff; color:#000; } .layout { display:block; width:auto; padding:0; } aside { display:none; } article { border:0; box-shadow:none; padding:0; } pre { white-space:pre-wrap; } }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside><strong>目录</strong><nav id="toc"></nav></aside>
+    <article>
+
+<h1>Claude Code 源码架构深度解析</h1>
+<blockquote>
+<p>基于本仓库恢复源码的静态分析，按照“入口层 → 运行时层 → 核心引擎 → 工具与能力 → 基础设施”五层模型，解释 Claude Code 如何把一次自然语言请求转化为可持续、多轮、可审计的 Agent 执行过程。</p>
+</blockquote>
+
+<h1>零、一次用户请求的完整执行流程</h1>
+<blockquote>
+<p>这一节先不按模块拆分，而是沿着一次真实请求从“用户按下回车”一直追踪到“Agent 返回最终结果”。它把后文分散介绍的输入预处理、记忆与上下文、Skill/Tool 路由、Hooks、Permission、Tool Runtime、Compact、Transcript 和 Stop 判定串成一条完整主链。</p>
+</blockquote>
+
+<h2>0.1 端到端流程图</h2>
+<pre><code class="language-text">┌──────────────────────────────────────────────────────────────────────────────┐
+│ 0. 会话/进程初始化                                                          │
+│ CLI / REPL / Headless / SDK / Remote                                       │
+│ main.tsx 加载 Settings、Permission Rules、MCP、Plugins、Session Restore     │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 1. 用户输入                                                                  │
+│ 例如：“检查这个项目的报错并修复它”                                          │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 2. 输入预处理 / Runtime                                                      │
+│ processUserInput                                                             │
+│                                                                              │
+│ • Slash Command                                                              │
+│ • @file / 图片 / 粘贴文本 /附件                                             │
+│ • 队列消息与输入元数据                                                       │
+│ • Skill / Plugin Command 相关解析                                            │
+│ • UserPromptSubmit 等生命周期 Hook                                           │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 3. 上下文、记忆与能力发现                                                    │
+│                                                                              │
+│ Memory / Context                         Capability                          │
+│ • mutableMessages / Transcript            • Built-in Tools                  │
+│ • CLAUDE.md / memory files                • MCP Tools                       │
+│ • Session Memory / Compact Summary        • Skill Index                     │
+│ • 已加载 nested memory paths              • Plugin Commands / Agents        │
+│ • Git / cwd / IDE / runtime context        • Tool JSON Schemas              │
+│                                                                              │
+│ 同时应用“能力暴露层”的权限/配置过滤：deny rules、isEnabled、mode、gates 等   │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 4. QueryEngine.submitMessage()                                               │
+│                                                                              │
+│ • 新用户消息写入 mutableMessages                                             │
+│ • 在模型调用前写入 transcript，保证异常退出后仍可恢复                        │
+│ • 建立本轮 ToolUseContext                                                    │
+│ • 绑定 tools / commands / MCP clients / permission context / abort signal   │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 5. query() / queryLoop()：准备模型请求                                       │
+│                                                                              │
+│ • 估算 Token Budget                                                          │
+│ • 必要时 Microcompact / Auto Compact                                         │
+│ • 组装 System Prompt + Memory + History + Tool Schemas + Skill Metadata     │
+│ • 调用 Claude Streaming API                                                  │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                                       ▼
+                               ┌────────────────┐
+                               │ 6. Claude 推理 │
+                               └───────┬────────┘
+                                       │
+                ┌──────────────────────┼────────────────────────┐
+                │                      │                        │
+                ▼                      ▼                        ▼
+        ┌──────────────┐      ┌─────────────────┐      ┌─────────────────┐
+        │ 直接文本回答 │      │ 直接原子 Tool  │      │ Skill 匹配      │
+        │ text/thinking│      │ Read/Bash/Edit… │      │ SkillTool(...)  │
+        └──────┬───────┘      └────────┬────────┘      └────────┬────────┘
+               │                       │                        │
+               │                       │                        ▼
+               │                       │             ┌──────────────────────┐
+               │                       │             │ SkillTool 也先经过   │
+               │                       │             │ 统一 Tool Runtime    │
+               │                       │             └──────────┬───────────┘
+               │                       │                        │
+               │                       │                        ▼
+               │                       │             ┌──────────────────────┐
+               │                       │             │ 加载完整 SKILL.md    │
+               │                       │             │ • Inline：注入 SOP   │
+               │                       │             │ • Fork：启动 Subagent│
+               │                       │             │ • model/effort/hooks │
+               │                       │             │ • allowed-tool rules │
+               │                       │             └──────────┬───────────┘
+               │                       │                        │
+               │                       │                        ▼
+               │                       │                Claude 按 Skill
+               │                       │                继续规划实际 Tools
+               │                       │                        │
+               │                       └──────────────┬─────────┘
+               │                                      │
+               │                                      ▼
+               │       ┌────────────────────────────────────────────────────┐
+               │       │ 7. Tool Runtime：单次 Tool Call 的执行管线         │
+               │       │                                                    │
+               │       │ Tool Lookup                                        │
+               │       │    ↓                                               │
+               │       │ inputSchema.safeParse()                            │
+               │       │    ↓                                               │
+               │       │ tool.validateInput()                               │
+               │       │    ↓                                               │
+               │       │ PreToolUse Hook                                    │
+               │       │    │                                               │
+               │       │    ├─ 修改 input                                   │
+               │       │    ├─ additional context                          │
+               │       │    └─ allow / ask / deny                          │
+               │       │    ↓                                               │
+               │       │ Permission Resolution                              │
+               │       │    │                                               │
+               │       │    ├─ Hook decision                                │
+               │       │    ├─ enterprise/project/user/local rules          │
+               │       │    ├─ CLI allowed/disallowed tools                 │
+               │       │    ├─ permission mode                              │
+               │       │    ├─ tool.checkPermissions()                      │
+               │       │    ├─ cwd / path authorization                     │
+               │       │    └─ local / remote user approval                 │
+               │       │    ↓                                               │
+               │       │ 允许？                                             │
+               │       │  ├─ No  → error tool_result                        │
+               │       │  └─ Yes → tool.call()                              │
+               │       │              ↓ progress                            │
+               │       │         success / exception / abort                 │
+               │       │              │                                      │
+               │       │      ┌───────┴────────┐                            │
+               │       │      ▼                ▼                            │
+               │       │ PostToolUse      PostToolUseFailure                 │
+               │       │ Hook             Hook                               │
+               │       │      └───────┬────────┘                            │
+               │       │              ▼                                      │
+               │       │ Result Normalization                               │
+               │       │ tool_result / attachments / contextModifier         │
+               │       └──────────────────────┬─────────────────────────────┘
+               │                              │
+               │                              ▼
+               │       ┌────────────────────────────────────────────────────┐
+               │       │ 8. 多 Tool 调度 / Concurrency                     │
+               │       │                                                    │
+               │       │ Batch: toolOrchestration.ts                        │
+               │       │ Streaming: StreamingToolExecutor.ts                 │
+               │       │                                                    │
+               │       │ isConcurrencySafe(input)                            │
+               │       │ • safe tools 可并发                                │
+               │       │ • unsafe tools 形成 barrier / 串行                  │
+               │       │ • 中断时补齐 synthetic tool_result                  │
+               │       └──────────────────────┬─────────────────────────────┘
+               │                              │
+               └──────────────────────┬───────┘
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 9. Observation 回填                                                         │
+│                                                                              │
+│ tool_result / Hook attachment / contextModifier 被写回 messages             │
+│ → QueryEngine 持续维护会话状态                                               │
+│ → queryLoop() 再次进入模型                                                   │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                              是否还需要行动？
+                              ┌────────┴────────┐
+                              │ Yes             │ No
+                              ▼                 ▼
+                      回到 Claude 推理      PostSampling Hook
+                                                │
+                                                ▼
+                                           Stop Hook
+                                                │
+                                  ┌─────────────┴─────────────┐
+                                  │ 允许结束                  │ 阻止结束
+                                  ▼                           ▼
+┌──────────────────────────────────────────┐          注入反馈并再次进入
+│ 10. 本轮完成                             │          queryLoop()
+│                                          │
+│ • 最终文本/结果返回 CLI/SDK              │
+│ • Transcript / Usage / Permission 状态   │
+│   持久化或更新                           │
+│ • File history / Session state 保留      │
+│ • 下次请求继续复用同一会话与记忆上下文   │
+└──────────────────────────────────────────┘
+</code></pre>
+
+
+<h2>0.2 阶段一：入口与输入预处理——把“用户输入”转换成“Agent 可执行请求”</h2>
+
+<h3>这一阶段具体实现什么功能？</h3>
+<p>用户在终端、SDK 或远程客户端提交的内容，并不会直接作为一个字符串送进 Claude API。Claude Code 先通过入口层与运行时层把输入转换成标准化的 <code>Message[]</code>、命令结果和本轮运行参数。这个阶段主要完成四件事：</p>
+<ol>
+<li><strong>识别输入类型</strong>：普通自然语言、Slash Command、Bash shortcut、附件、<code>@file</code> 引用、图片或结构化输入。</li>
+<li><strong>执行本地命令分流</strong>：有些 Slash Command 可以在不调用模型的情况下直接修改本地状态，例如模型、权限模式、消息历史或 compact 状态。</li>
+<li><strong>把额外上下文转换成 Message</strong>：文件引用、Skill Command、Plugin Command、系统提醒和 Hook 输出最终都要转换成 QueryEngine 能消费的消息。</li>
+<li><strong>决定是否真的进入模型</strong>：<code>processUserInput()</code> 返回的不只是消息，还包括 <code>shouldQuery</code>、<code>allowedTools</code>、model override 和本地 <code>resultText</code> 等结果。</li>
+</ol>
+
+<h3>关键源码位置</h3>
+<pre><code class="language-text">src/entrypoints/cli.tsx
+src/main.tsx
+src/replLauncher.tsx
+src/screens/REPL.tsx
+src/utils/processUserInput/processUserInput.ts
+src/utils/processUserInput/processSlashCommand.tsx
+src/utils/processUserInput/processTextPrompt.ts
+src/commands.ts
+</code></pre>
+
+<h3>源码中的主逻辑</h3>
+<p><code>QueryEngine.submitMessage()</code> 会先构造一个 <code>ProcessUserInputContext</code>。这里已经把会话已有消息、Tool、Command、MCP Client、当前模型、Thinking Config、AppState、AbortController、文件读取状态、nested memory 路径和本轮 Skill discovery 集合等放进上下文。随后调用：</p>
+<pre><code class="language-ts">const {
+  messages: messagesFromUserInput,
+  shouldQuery,
+  allowedTools,
+  model: modelFromUserInput,
+  resultText,
+} = await processUserInput({
+  input: prompt,
+  mode: 'prompt',
+  context: {
+    ...processUserInputContext,
+    messages: this.mutableMessages,
+  },
+  messages: this.mutableMessages,
+  ...
+})
+</code></pre>
+
+<p>这说明 <code>processUserInput()</code> 不是简单的 parser，而是<strong>输入路由器 + Command Runtime Adapter</strong>。它有能力改变“这一轮要不要调用模型”和“调用模型时要使用什么运行参数”。</p>
+
+<h3>为什么需要这个阶段？</h3>
+<p>如果所有输入都直接送给模型，那么诸如 <code>/compact</code>、<code>/model</code>、Skill 显式命令、文件引用和本地控制命令都必须让模型“理解后再决定怎么执行”，既浪费 Token，也会把确定性操作变成概率性决策。Claude Code 把这些确定性输入先在本地解析，因此形成：</p>
+<pre><code class="language-text">User Input
+   ↓
+Deterministic Local Parsing
+   ↓
+需要模型？ ── No → 本地完成
+   │
+  Yes
+   ↓
+Standard Message[] + Runtime Overrides
+</code></pre>
+
+<h3>这一阶段的输出交给谁？</h3>
+<p>输出首先回到 <code>QueryEngine.submitMessage()</code>。如果 <code>shouldQuery=false</code>，可能直接结束当前请求；如果需要模型，则把 <code>messagesFromUserInput</code> 加入 <code>mutableMessages</code>，然后进入后面的会话持久化、上下文组装和 <code>query()</code>。</p>
+
+
+<h2>0.3 阶段二：记忆与 Context——把“历史、规则、环境”重新构造成模型可见上下文</h2>
+
+<h3>Claude Code 的 Memory 不是单一数据库</h3>
+<p>结合源码，Claude Code 中“记忆”更准确地说是多层 Context State。模型本身不会在两次 API 请求之间自动保留状态，因此每次调用前，Runtime 都必须重新构造模型需要知道的信息。</p>
+
+<table>
+<thead><tr><th>层级</th><th>典型载体</th><th>生命周期</th><th>主要作用</th></tr></thead>
+<tbody>
+<tr><td>Conversation Memory</td><td><code>mutableMessages</code></td><td>整个会话</td><td>保留 user、assistant、tool_use、tool_result、compact boundary。</td></tr>
+<tr><td>Persistent Instructions</td><td><code>CLAUDE.md</code> / memory files</td><td>跨会话或项目级</td><td>提供项目规范、用户偏好、运行约束。</td></tr>
+<tr><td>Nested Memory</td><td><code>loadedNestedMemoryPaths</code></td><td>会话内动态扩展</td><td>进入子目录或相关范围时按需加载更局部的记忆。</td></tr>
+<tr><td>Compact Memory</td><td>compact summary / compact boundary</td><td>长会话</td><td>把较早历史压缩后继续保留任务关键状态。</td></tr>
+<tr><td>Environment Context</td><td>Git、cwd、日期、IDE、系统状态</td><td>通常按会话缓存</td><td>让模型知道当前项目与运行环境。</td></tr>
+<tr><td>Execution State</td><td><code>readFileState</code>、permission context</td><td>跨 Tool Call / 跨 turn</td><td>保证 Tool 行为建立在已知文件状态和授权状态之上。</td></tr>
+</tbody>
+</table>
+
+<h3>QueryEngine 如何保存跨轮状态？</h3>
+<p><code>QueryEngine</code> 构造函数将以下对象保存为实例字段，而不是每次请求重新创建：</p>
+<pre><code class="language-ts">this.mutableMessages = config.initialMessages ?? []
+this.abortController = config.abortController ?? createAbortController()
+this.permissionDenials = []
+this.readFileState = config.readFileCache
+this.totalUsage = EMPTY_USAGE
+
+private discoveredSkillNames = new Set&lt;string&gt;()
+private loadedNestedMemoryPaths = new Set&lt;string&gt;()
+</code></pre>
+
+<p>其中一个很值得注意的细节是：</p>
+<ul>
+<li><code>discoveredSkillNames</code> 是 turn-scoped，每次 <code>submitMessage()</code> 开始时会 <code>clear()</code>，因为它只跟踪“这一轮模型发现了哪些 Skill”。</li>
+<li><code>loadedNestedMemoryPaths</code> 不在每轮清空，因此它可以跨 turn 记录已经加载的 nested memory，避免重复注入。</li>
+</ul>
+
+<h3>CLAUDE.md / Memory 如何进入请求？</h3>
+<p>源码把 System Prompt、User Context 和 System Context 分开构造，而不是拼成一个巨大的字符串：</p>
+<pre><code class="language-text">System Prompt
+   ├─ 默认 Agent 规则
+   ├─ Tool 使用说明
+   ├─ model / mode / feature 相关动态段
+   └─ custom / append prompt
+
+User Context
+   ├─ CLAUDE.md / memory files
+   └─ current date
+
+System Context
+   └─ Git / environment 等状态
+
+Messages
+   └─ 会话历史 + Tool observations
+</code></pre>
+
+<p><code>src/context.ts</code> 的 <code>getUserContext()</code> 会组织 CLAUDE.md 和记忆文件；<code>getSystemContext()</code> 负责环境信息。<code>src/utils/queryContext.ts</code> 再把这些部分统一交给 QueryEngine。这个拆分的价值是不同 Context 有不同缓存生命周期，避免每轮重复做昂贵 I/O。</p>
+
+<h3>为什么 Tool Result 也属于短期记忆？</h3>
+<p>模型执行一个 Tool 后，结果不会只展示给 UI，而会被转成 <code>tool_result</code> 写回消息历史。下一轮 Claude API 因此看到的是：</p>
+<pre><code class="language-text">用户目标
++
+之前的 reasoning / text
++
+tool_use
++
+tool_result
++
+后续系统/Hook context
+</code></pre>
+<p>所以 Agent 的“短期记忆”本质上就是持续增长的 Message State。</p>
+
+<h3>这一阶段的系统作用</h3>
+<p>它解决的是<strong>LLM API 无状态与 Agent 任务有状态之间的矛盾</strong>。Claude 本身每次 API 调用都重新计算，但 QueryEngine + Context Builder 让它表现成一个持续记住项目、对话、文件和任务进度的 Agent。</p>
+
+
+<h2>0.4 阶段三：能力发现与能力暴露——先决定“模型能看到哪些能力”</h2>
+
+<h3>这一阶段具体做什么？</h3>
+<p>在 Claude 做 Tool/Skill 选择之前，Runtime 先构建一个可见能力空间。这一步不是最终 Permission Check，而是更早的 <strong>Capability Exposure</strong>：</p>
+<ul>
+<li>哪些 Built-in Tools 进入 Tool Pool。</li>
+<li>哪些 MCP Tools 当前可用。</li>
+<li>哪些 Tool 因 mode / feature gate / deny rule / <code>isEnabled()</code> 被隐藏。</li>
+<li>哪些 Skill 可以被模型主动发现。</li>
+<li>哪些 Agent / Commands 可用。</li>
+</ul>
+
+<h3>Tool Pool 的逻辑</h3>
+<p>基础 Tool 经过注册、过滤、动态启用和 MCP 合并后，才形成模型能看到的 Tool Schema。核心思想是：</p>
+<pre><code class="language-text">Base Tools
+   ↓
+mode / feature gate
+   ↓
+deny / configured tool filters
+   ↓
+tool.isEnabled()
+   ↓
+merge MCP tools
+   ↓
+dedupe + stable sort
+   ↓
+Final Tool Pool
+   ↓
+Tool JSON Schemas → Claude API
+</code></pre>
+
+<p>稳定排序还有一个额外工程目的：尽量保持 Tool 定义前缀稳定，提高 Prompt Cache 命中率。</p>
+
+<h3>Skill 为什么不直接把所有 SKILL.md 发给模型？</h3>
+<p>Skill 使用的是两级发现：</p>
+<pre><code class="language-text">Stage 1: Skill Index
+name + description + whenToUse
+        ↓
+Claude semantic matching
+        ↓
+Stage 2: SkillTool(skill=...)
+        ↓
+Load full SKILL.md
+</code></pre>
+
+<p><code>SkillTool/prompt.ts</code> 明确告诉模型：Available skills 会以系统提醒形式列出；如果某个 Skill 与用户请求匹配，必须先调用 SkillTool，再继续处理任务。因此 Claude 本身承担 Skill Router 的角色。</p>
+
+<h3>为什么“复杂任务”不等于“Skill”？</h3>
+<p>源码中没有一个 <code>if complexity &gt; threshold then skill</code> 的 Router。判断更接近：</p>
+<pre><code class="language-text">是否存在明确适配当前任务的过程知识？
+      │
+   Yes → SkillTool
+   No  → Claude 自主规划 + Atomic Tools
+</code></pre>
+
+<p>例如一个很复杂的 race condition 调试任务，如果没有对应 Skill，Claude 仍可以通过 Read/Grep/Bash/Edit 运行几十轮；而“提交代码”虽然简单，如果存在 commit Skill，也可能先调用 Skill。</p>
+
+<h3>能力暴露与最终权限是两回事</h3>
+<p>这一阶段只决定“模型有哪些 Action Candidate”。真正执行时，<code>toolExecution.ts</code> 还会再次进入 Permission Resolution。因此：</p>
+<pre><code class="language-text">Tool visible to model
+        ≠
+Tool authorized to execute
+</code></pre>
+
+<p>这是 Claude Code 权限架构最重要的分层之一。</p>
+
+
+<h2>0.5 阶段四：QueryEngine.submitMessage()——一次用户 Turn 的会话级事务入口</h2>
+
+<h3>QueryEngine 为什么不是一个简单 API Wrapper？</h3>
+<p><code>QueryEngine</code> 的注释明确把它定义为 conversation lifecycle owner。一个 Conversation 对应一个 QueryEngine；同一个实例的多次 <code>submitMessage()</code> 共享 messages、file cache、usage、permission denial 等状态。</p>
+
+<h3>submitMessage() 开始时做什么？</h3>
+<p>首先从 config 取出：</p>
+<pre><code class="language-text">cwd
+commands
+tools
+mcpClients
+thinkingConfig
+maxTurns / budget
+canUseTool
+customSystemPrompt
+fallbackModel
+getAppState / setAppState
+agents
+...
+</code></pre>
+
+<p>随后有几个很重要的步骤。</p>
+
+<h3>① 清理本轮 Skill discovery，并设置 cwd</h3>
+<pre><code class="language-ts">this.discoveredSkillNames.clear()
+setCwd(cwd)
+</code></pre>
+<p>Skill discovery 是 turn-scoped；而 cwd 是后续文件和 Shell Tool 的运行基础。</p>
+
+<h3>② 包装 canUseTool，记录权限拒绝</h3>
+<p>QueryEngine 不直接把原始 <code>canUseTool</code> 传下去，而是创建 <code>wrappedCanUseTool</code>：</p>
+<pre><code class="language-ts">const wrappedCanUseTool = async (...) =&gt; {
+  const result = await canUseTool(...)
+  if (result.behavior !== 'allow') {
+    this.permissionDenials.push({
+      tool_name,
+      tool_use_id,
+      tool_input,
+    })
+  }
+  return result
+}
+</code></pre>
+<p>作用是把 Permission 不只是当“执行时的控制”，还变成一个可追踪的 Session/SDK 输出状态。这样 SDK 最终可以知道本轮哪些 Tool 被拒绝。</p>
+
+<h3>③ 构建 ProcessUserInputContext</h3>
+<p>这个 Context 会被输入解析和后续 Tool Runtime 共同使用，其中包含：</p>
+<ul>
+<li>当前 messages。</li>
+<li>tools / commands / MCP clients。</li>
+<li>mainLoopModel / thinkingConfig。</li>
+<li>getAppState / setAppState。</li>
+<li>AbortController。</li>
+<li><code>readFileState</code>。</li>
+<li><code>loadedNestedMemoryPaths</code>。</li>
+<li><code>discoveredSkillNames</code>。</li>
+<li>file history updater。</li>
+</ul>
+
+<p>这说明 <code>ToolUseContext</code> 实际上是跨越 UI、Session、Permission、Tool 和 Memory 的执行上下文。</p>
+
+<h3>④ 处理 orphaned permission</h3>
+<p>源码还有 <code>handleOrphanedPermission()</code> 路径，并且通过 <code>hasHandledOrphanedPermission</code> 保证一个 QueryEngine 生命周期中只处理一次。它用于恢复一个之前已经发起、但因为远程/进程边界没有正常完成的 Permission 请求。</p>
+
+<h3>⑤ 调用 processUserInput()</h3>
+<p>输入处理后，返回的 <code>messagesFromUserInput</code> 才真正加入：</p>
+<pre><code class="language-ts">this.mutableMessages.push(...messagesFromUserInput)
+const messages = [...this.mutableMessages]
+</code></pre>
+
+<h3>⑥ 为什么用户消息必须在调用模型之前写入 Transcript？</h3>
+<p>源码对此有一段很长的注释：如果只在 Query Loop yield assistant message 后才写 Transcript，那么用户点击 Stop、进程被杀掉或 Desktop 重启发生在第一条 API 响应之前时，Session Log 里可能只有 queue-operation，没有真正用户消息，导致 <code>--resume</code> 找不到可恢复会话。</p>
+
+<p>因此实现是：</p>
+<pre><code class="language-ts">const transcriptPromise = recordTranscript(messages)
+
+if (isBareMode()) {
+  void transcriptPromise
+} else {
+  await transcriptPromise
+}
+</code></pre>
+
+<p>交互模式宁愿付出几毫秒 I/O，也要确保“用户请求被接受”这一事实先持久化；Bare/script 模式则 fire-and-forget，优先减少关键路径延迟。</p>
+
+<h3>系统作用</h3>
+<p><code>submitMessage()</code> 可以理解成一次 Turn 的<strong>会话事务协调器</strong>：它负责把输入、记忆、权限跟踪、持久化、Tool Context 和 Query Loop 接起来。</p>
+
+
+<h2>0.6 阶段五：query() / queryLoop()——真正的 Agent Runtime 状态机</h2>
+
+<h3>query() 和 queryLoop() 的区别</h3>
+<p><code>query()</code> 是很薄的一层：创建 <code>consumedCommandUuids</code>，把真正执行交给 <code>queryLoop()</code>，正常结束后再通知 Command lifecycle completed。</p>
+
+<p>真正的 Agent Loop 在：</p>
+<pre><code class="language-ts">async function* queryLoop(...)
+</code></pre>
+
+<h3>为什么叫状态机？</h3>
+<p><code>queryLoop()</code> 明确拆出了 Immutable Params 和 Mutable Cross-Iteration State：</p>
+<pre><code class="language-ts">let state = {
+  messages,
+  toolUseContext,
+  maxOutputTokensOverride,
+  autoCompactTracking,
+  stopHookActive,
+  maxOutputTokensRecoveryCount,
+  hasAttemptedReactiveCompact,
+  turnCount,
+  pendingToolUseSummary,
+  transition,
+}
+</code></pre>
+
+<p>这里最关键的是：<strong>同一个用户 Turn 内部可以发生多次 Claude API 请求。</strong>例如：</p>
+<pre><code class="language-text">Iteration 1:
+Claude → tool_use
+
+Iteration 2:
+tool_result → Claude → tool_use
+
+Iteration 3:
+tool_result → Claude → final answer
+</code></pre>
+
+<p>或者恢复路径：</p>
+<pre><code class="language-text">Claude API
+   ↓ prompt too long
+Reactive Compact
+   ↓
+Retry Claude API
+</code></pre>
+
+<h3>模型请求前会做哪些准备？</h3>
+<p>queryLoop 的每个 iteration 需要综合：</p>
+<ul>
+<li>当前 messages。</li>
+<li>systemPrompt / userContext / systemContext。</li>
+<li>当前 ToolUseContext。</li>
+<li>模型 / fallback model。</li>
+<li>Token Budget。</li>
+<li>Auto Compact tracking。</li>
+<li>Stop Hook state。</li>
+</ul>
+
+<p>这些数据被送到 API 层，模型开始 Streaming。</p>
+
+<h3>Streaming 时 queryLoop 做什么？</h3>
+<p>它不是等模型完整返回后一次性处理，而是边流边处理：</p>
+<ul>
+<li>文本和 thinking 可以立即 yield 给 UI/SDK。</li>
+<li>assistant message 被累计到 <code>assistantMessages</code>。</li>
+<li>其中的 <code>tool_use</code> block 会被抽取到 <code>toolUseBlocks</code>。</li>
+<li>设置 <code>needsFollowUp=true</code>，表示这一轮不能结束。</li>
+<li>开启 Streaming Tool Execution 时，完整 ToolUseBlock 会立刻交给 <code>StreamingToolExecutor.addTool()</code>。</li>
+</ul>
+
+<h3>为什么错误有时不会立即展示？</h3>
+<p>源码会暂时 withheld 一些可恢复错误，例如 prompt-too-long、max-output-tokens 或媒体大小错误。原因是 Runtime 可能通过 Context Collapse、Reactive Compact 或 Truncation Retry 修复。如果立刻把错误显示给用户，就会出现“用户先看到失败，随后系统其实又恢复成功”的混乱体验。</p>
+
+<h3>系统作用</h3>
+<p><code>queryLoop()</code> 是整个 Agent Runtime 的核心控制平面。它不负责某个具体 Tool 怎么执行，而负责：</p>
+<pre><code class="language-text">现在该调用模型？
+还是执行 Tool？
+还是 Compact？
+还是 Retry？
+还是 Stop？
+</code></pre>
+
+
+<h2>0.7 阶段六：Skill / Tool 选择——Claude 是语义 Router，但 Runtime 决定执行语义</h2>
+
+<h3>Claude 做的决策是什么？</h3>
+<p>在模型上下文中，同时存在：</p>
+<ul>
+<li>普通 Tool definitions。</li>
+<li>SkillTool definition。</li>
+<li>Available Skills 的轻量索引。</li>
+<li>System Prompt 中关于 Tool/Skill 使用的说明。</li>
+</ul>
+
+<p>于是 Claude 可能输出三类结果：</p>
+<pre><code class="language-text">A. 直接 text / thinking
+B. Atomic Tool Use
+C. SkillTool Use
+</code></pre>
+
+<h3>Skill 匹配为什么具有优先级？</h3>
+<p><code>SkillTool/prompt.ts</code> 中明确要求：当某个 Available Skill 与用户请求匹配时，应先调用 SkillTool，再对任务产生其他响应。这把 Skill 从“可选参考”升级成“匹配时优先加载的过程知识”。</p>
+
+<h3>SkillTool 调用以后发生什么？</h3>
+<p><code>SkillTool.ts</code> 会先通过 <code>getAllCommands()</code> 找到对应 Skill Command，并记录 Skill usage。随后分两条路径：</p>
+
+<h4>Inline Skill</h4>
+<pre><code class="language-text">SkillTool
+   ↓
+processPromptSlashCommand()
+   ↓
+processedCommand.messages
+   ↓
+tagMessagesWithToolUseID()
+   ↓
+newMessages 注入当前 Agent
+</code></pre>
+
+<p>源码还特别注释：Skill hooks 已经在 <code>processPromptSlashCommand()</code> 内通过 <code>getMessagesForPromptSlashCommand</code> 注册，因此 SkillTool 不应重复注册，否则会 double-register hooks。</p>
+
+<h4>Fork Skill</h4>
+<p>若：</p>
+<pre><code class="language-ts">command.type === 'prompt' &amp;&amp; command.context === 'fork'
+</code></pre>
+<p>则进入 <code>executeForkedSkill()</code>，在独立 Agent Context 和独立 Token Budget 中运行 Skill。这意味着 Skill 可以从“Prompt 模板”升级成“Subagent Workflow Template”。</p>
+
+<h3>Skill 的 allowedTools 到底如何生效？</h3>
+<p>Inline Skill 处理后会读取：</p>
+<pre><code class="language-ts">const allowedTools = processedCommand.allowedTools || []
+const model = processedCommand.model
+const effort = command?.type === 'prompt' ? command.effort : undefined
+</code></pre>
+
+<p>随后通过 <code>contextModifier()</code> 修改 ToolUseContext。尤其是 <code>allowedTools</code> 被合并进：</p>
+<pre><code class="language-text">toolPermissionContext
+  .alwaysAllowRules
+  .command
+</code></pre>
+
+<p>所以它更准确地表示“Skill 对后续 Tool 的预授权规则”，而不是简单把整个 Tool Pool 裁剪成只剩 allowedTools。</p>
+
+<h3>Skill 还能改变哪些运行参数？</h3>
+<ul>
+<li>如果 Skill 指定 model，<code>contextModifier</code> 修改 <code>mainLoopModel</code>。</li>
+<li>如果指定 effort，则修改 AppState 的 <code>effortValue</code>。</li>
+<li>Skill 自身的 Hooks 会成为后续执行链的一部分。</li>
+</ul>
+
+<h3>系统作用</h3>
+<p>这一阶段建立了一个层次化能力路由：</p>
+<pre><code class="language-text">Claude
+  ├─ Atomic Tool
+  ├─ SkillTool → SOP → Atomic Tools
+  └─ AgentTool → Subagent
+</code></pre>
+<p>Tool 解决“执行动作”，Skill 解决“采用哪套经过沉淀的方法执行一类任务”。</p>
+
+
+<h2>0.8 阶段七：Tool Runtime——从 tool_use 到可审计 tool_result 的完整执行事务</h2>
+
+<h3>统一入口：runToolUse()</h3>
+<p>无论上层使用 Batch Scheduler 还是 Streaming Scheduler，最终单个 Tool Call 都进入：</p>
+<pre><code class="language-ts">runToolUse(
+  toolUse,
+  assistantMessage,
+  canUseTool,
+  toolUseContext
+)
+</code></pre>
+
+<p>它首先通过 Tool Name 找到当前模型可见的 Tool；为了兼容旧 transcript，还存在 deprecated alias fallback。MCP Tool 在这里也被识别并附带 server transport / safe URL metadata。</p>
+
+<h3>第一层：Schema Validation</h3>
+<p>源码直接说明模型并不总能生成正确类型，因此首先做：</p>
+<pre><code class="language-ts">const parsedInput = tool.inputSchema.safeParse(input)
+</code></pre>
+
+<p>失败时不会直接 throw 掉 Agent Loop，而会把 Zod 错误转换成 error <code>tool_result</code>，让 Claude 下一轮看到错误后自行修复参数。</p>
+
+<p>Deferred Tool Schema 场景还有额外处理：如果 Tool 本地存在，但它的完整 schema 没有发给模型，系统会在 Validation Error 中加入提示，让模型先通过 ToolSearch 发现/加载 schema，而不是无意义地重复尝试错误参数。</p>
+
+<h3>第二层：tool.validateInput()</h3>
+<p>Schema 只能回答“JSON 结构是否合法”，不能回答业务语义是否合法。例如：</p>
+<ul>
+<li>文件路径是否符合 Tool 约束。</li>
+<li>某些字段组合是否冲突。</li>
+<li>参数范围是否合法。</li>
+</ul>
+
+<p>所以 Tool 还可以实现 <code>validateInput()</code> 做语义级检查。</p>
+
+<h3>第三层：PreToolUse Hooks</h3>
+<p><code>toolExecution.ts</code> 会调用 <code>runPreToolUseHooks()</code>。Hook 不只是日志，它可以：</p>
+<ul>
+<li>产生 progress / attachment。</li>
+<li>修改 Tool Input。</li>
+<li>增加 additionalContext。</li>
+<li>给出 allow / ask / deny。</li>
+<li>设置 <code>preventContinuation</code> / stop reason。</li>
+</ul>
+
+<p>因此 PreToolUse 是一个真正的 <strong>Execution Interceptor</strong>。</p>
+
+<h3>第四层：Permission Resolution</h3>
+<p>Hook 决策随后进入 <code>resolveHookPermissionDecision()</code>，再与正常权限系统合并。最终会综合：</p>
+<ul>
+<li>Hook permission result。</li>
+<li>Tool 是否要求强制用户交互。</li>
+<li>settings 中 allow / ask / deny rule。</li>
+<li>当前 permission mode。</li>
+<li><code>tool.checkPermissions()</code> 的 Tool-specific 判断。</li>
+<li>cwd / additional directories 等路径授权。</li>
+<li>本地终端、SDK 或 Remote Bridge 的人工批准。</li>
+</ul>
+
+<div class="warn">
+<strong>一个重要安全不变量：</strong>PreToolUse Hook 返回 allow，不意味着可以绕过 settings 中更强的 deny/ask 规则。Hook 是扩展层，不是绕过核心安全边界的后门。
+</div>
+
+<h3>第五层：tool.call()</h3>
+<p>只有最终 Permission Decision 允许后，Runtime 才真正进入具体 Tool 的：</p>
+<pre><code class="language-ts">tool.call(...)
+</code></pre>
+
+<p>Read/Bash/Edit/MCP 的真正副作用都发生在这里。执行过程中 progress callback 会通过 <code>streamedCheckPermissionsAndCallTool()</code> 包装成 AsyncIterable，所以上层 Scheduler 可以统一通过 <code>for await</code> 接收 progress 和最终消息。</p>
+
+<h3>第六层：Post Hooks 与错误路径</h3>
+<p>成功：</p>
+<pre><code class="language-text">tool.call()
+  ↓
+Result Mapping
+  ↓
+PostToolUse Hook
+  ↓
+tool_result
+</code></pre>
+
+<p>异常：</p>
+<pre><code class="language-text">tool.call() throws / abort
+  ↓
+error classification
+  ↓
+MCP auth state update（如果适用）
+  ↓
+PostToolUseFailure Hook
+  ↓
+error tool_result
+</code></pre>
+
+<p>这里的关键设计是：<strong>Tool Error 尽量被转换成 Observation，而不是让 Agent Runtime 直接崩溃。</strong>模型下一轮可以看到错误并决定换参数、换 Tool 或重新规划。</p>
+
+<h3>系统作用</h3>
+<p><code>toolExecution.ts</code> 相当于 Tool Runtime 的“事务内核”：把不可信的 LLM Action 转换成经过校验、策略、权限和观测治理的可执行动作。</p>
+
+
+<h2>0.9 阶段八：Hooks 与 Permission——为什么它们要单独作为一层？</h2>
+
+<h3>Hook 与 Permission 的职责区别</h3>
+<table>
+<thead><tr><th>机制</th><th>主要职责</th><th>典型输出</th></tr></thead>
+<tbody>
+<tr><td>Hook</td><td>允许外部策略在生命周期节点介入</td><td>修改 input、additional context、allow/ask/deny、stop、attachment</td></tr>
+<tr><td>Permission</td><td>决定当前 Tool Call 是否被 Runtime 最终授权</td><td>allow / ask / deny + updatedInput</td></tr>
+</tbody>
+</table>
+
+<h3>resolveHookPermissionDecision() 为什么重要？</h3>
+<p>它是 Hook 与核心 Permission System 的汇合点。其逻辑不是：</p>
+<pre><code class="language-text">Hook says allow → execute
+</code></pre>
+<p>而更接近：</p>
+<pre><code class="language-text">Hook Result
+   ↓
+需要强制交互？
+   ↓
+Rule-based Permissions
+   ↓
+Tool-specific Permissions
+   ↓
+User / Remote Approval
+   ↓
+Final Decision
+</code></pre>
+
+<p>当 Hook 给出 <code>ask</code> 时，Hook 的理由会成为 forceDecision 的一部分，传给 <code>canUseTool()</code>。如果 Hook 修改了 input，后续 Permission Check 应针对修改后的 input 做决定，而不是原始 input。</p>
+
+<h3>PostToolUse Hook 能做什么？</h3>
+<p>它可以：</p>
+<ul>
+<li>输出普通 Hook message / progress。</li>
+<li>加入 additional context。</li>
+<li>通过 <code>preventContinuation</code> 阻止 Agent 继续。</li>
+<li>生成 blocking error。</li>
+<li>对 MCP Tool Output 做修改后再送回 Agent。</li>
+</ul>
+
+<h3>PostToolUseFailure Hook 的作用</h3>
+<p>Tool 失败时仍然给扩展系统一个明确生命周期节点，因此企业策略、自动诊断、通知、失败修复逻辑不需要侵入每个具体 Tool。</p>
+
+<h3>系统作用</h3>
+<p>拆出 Hook Layer 的价值是把：</p>
+<pre><code class="language-text">核心执行逻辑
+与
+组织策略 / 插件行为 / 外部治理
+</code></pre>
+<p>解耦。Tool 本身只实现能力，Policy 不需要复制到每一个 Tool 中。</p>
+
+
+<h2>0.10 阶段九：多 Tool 并发、Observation 回填与 Context Mutation——让 Agent 既快又保持确定性</h2>
+
+<h3>Batch 路径：toolOrchestration.ts</h3>
+<p>当一轮 assistant response 中包含多个 ToolUseBlock，<code>runTools()</code> 会调用 <code>partitionToolCalls()</code>。每个调用先解析 input，然后调用：</p>
+<pre><code class="language-ts">tool.isConcurrencySafe(parsedInput.data)
+</code></pre>
+
+<p>若 Schema 解析失败或并发安全判断抛异常，Runtime 保守地认为 <code>false</code>。这是 fail-closed 策略。</p>
+
+<h3>为什么不是简单“Read 并发、Write 串行”？</h3>
+<p>真实判断是 invocation-level 的 <code>isConcurrencySafe(input)</code>，同一个 Tool 在不同 input 下理论上可以有不同安全性。</p>
+
+<h3>连续 safe batch 的原因</h3>
+<pre><code class="language-text">Read A
+Read B
+Edit C
+Read D
+</code></pre>
+
+<p>会形成：</p>
+<pre><code class="language-text">Batch 1: Read A + Read B
+Barrier : Edit C
+Batch 2: Read D
+</code></pre>
+
+<p>不能把 Read D 提前到 Edit C 前，因为它可能就是为了读取 Edit C 修改后的状态。</p>
+
+<h3>并发 Context Modifier 为什么要延迟应用？</h3>
+<p>如果 A、B 并发执行：</p>
+<pre><code class="language-text">A starts ───────── finishes later
+B starts ─── finishes earlier
+</code></pre>
+
+<p>若按完成时间立刻应用 Context Modifier，那么最终 Context 取决于网络/磁盘时间，系统变成非确定性。Batch Scheduler 因此先按 ToolUseID 暂存 modifier，等 batch 完成后再按模型原始 Tool 顺序应用。</p>
+
+<h3>Streaming 路径：StreamingToolExecutor</h3>
+<p>当 feature gate 开启时，模型还在输出时，完整的 ToolUseBlock 会立即：</p>
+<pre><code class="language-ts">streamingToolExecutor.addTool(toolBlock, message)
+</code></pre>
+
+<p><code>addTool()</code> 会：</p>
+<ol>
+<li>查找 Tool。</li>
+<li>Schema parse。</li>
+<li>计算 <code>isConcurrencySafe</code>。</li>
+<li>创建 <code>queued</code> TrackedTool。</li>
+<li>调用 <code>processQueue()</code>。</li>
+</ol>
+
+<p><code>processQueue()</code> 再通过 <code>canExecuteTool()</code> 决定启动条件：没有工具运行时任何 Tool 都可以启动；如果已有 Tool 在运行，只有“新 Tool safe 且所有正在运行的 Tool 都 safe”才能并发。因此 unsafe Tool 获得 exclusive access，并形成 concurrency barrier。</p>
+
+<h3>为什么需要 synthetic tool_result？</h3>
+<p>如果模型 Streaming fallback、用户中断或 sibling error 发生在 <code>tool_use</code> 已经产生之后，API Transcript 仍然必须保持：</p>
+<pre><code class="language-text">tool_use.id
+   ↕
+tool_result.tool_use_id
+</code></pre>
+
+<p>所以 StreamingToolExecutor 会为没有正常完成的 Tool 生成 synthetic error result，防止 transcript 留下 orphan tool_use。</p>
+
+<h3>Observation 如何回到 Agent？</h3>
+<p>Tool Scheduler yield 出来的消息会被加入当前 Query State；Tool Result 随后进入下一轮 <code>messages</code>。于是：</p>
+<pre><code class="language-text">Claude
+  ↓ tool_use
+Tool Runtime
+  ↓ tool_result
+messages += observation
+  ↓
+Claude next iteration
+</code></pre>
+
+<p>这就是 ReAct 式 Agent Loop 在 Claude Code 源码中的具体落点。</p>
+
+
+<h2>0.11 阶段十：Compact、Stop Hook 与最终完成——决定“何时继续、何时压缩、何时真正结束”</h2>
+
+<h3>为什么 Agent 不能一直把所有历史塞给模型？</h3>
+<p>随着每轮 Tool Result、文件内容和图片不断积累，Message History 会快速逼近 Context Window。Claude Code 因此不是等 API 彻底报错才处理，而是维护多级 Compact 策略。</p>
+
+<h3>第一层：Microcompact</h3>
+<p>Microcompact 的核心思想不是生成对话摘要，而是<strong>局部替换旧的大型可再获取内容</strong>。例如旧 Tool Result：</p>
+<pre><code class="language-ts">if (
+  block.type === 'tool_result' &&
+  clearSet.has(block.tool_use_id)
+) {
+  return {
+    ...block,
+    content: TIME_BASED_MC_CLEARED_MESSAGE
+  }
+}
+</code></pre>
+
+<p>它保留 <code>tool_result</code> block 和 <code>tool_use_id</code>，只替换内容，因此消息协议结构仍然合法。这也是“Tool Result 可以视为可重新获取的数据，而不是永久保留的唯一事实来源”的工程基础之一。</p>
+
+<h3>第二层：Auto Compact</h3>
+<p><code>autoCompact.ts</code> 中：</p>
+<pre><code class="language-ts">shouldAutoCompact(messages, model, querySource, ...)
+</code></pre>
+
+<p>会根据 token count、模型有效窗口和 warning threshold 决定是否需要完整压缩。还存在：</p>
+<pre><code class="language-text">MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
+</code></pre>
+<p>用于避免 Compact 连续失败后陷入无限循环。</p>
+
+<p><code>autoCompactIfNeeded()</code> 只有在真正超过阈值时才进入完整 Compact。Full Compact 会生成结构化摘要、写 compact boundary，并保留必要的最近上下文和恢复附件。</p>
+
+<h3>为什么 Compact 以后还要恢复重要文件/Skill 状态？</h3>
+<p>纯摘要可能保留“我们正在修改 query.ts”，但丢掉模型刚刚读取过的精确代码。于是 Compact 后 Runtime 会在预算范围内重新注入最近重要文件、Skill、计划或 Agent 状态，保证任务仍能继续执行。</p>
+
+<h3>模型没有 Tool Call，就一定结束吗？</h3>
+<p>不一定。Claude 生成看似最终文本之后，Runtime 仍可进入 PostSampling / Stop Hook。</p>
+
+<p><code>handleStopHooks()</code> 会构造一个 Stop Hook Context，其中包含：</p>
+<ul>
+<li>本轮完整 messages。</li>
+<li>assistantMessages。</li>
+<li>systemPrompt。</li>
+<li>userContext / systemContext。</li>
+<li>toolUseContext。</li>
+<li>querySource。</li>
+</ul>
+
+<h3>Stop Hook 有三种核心结果</h3>
+<table>
+<thead><tr><th>结果</th><th>Runtime 行为</th></tr></thead>
+<tbody>
+<tr><td>正常通过</td><td>允许 Agent 完成本轮。</td></tr>
+<tr><td><code>blockingErrors</code></td><td>将错误作为新的 user/meta message 送回 Agent，要求继续处理。</td></tr>
+<tr><td><code>preventContinuation</code></td><td>直接阻止继续执行，并记录 stop reason。</td></tr>
+</tbody>
+</table>
+
+<p>对于 teammate / task 场景，Stop Hook 之后还可能继续执行 TaskCompleted / TeammateIdle 等生命周期 Hook。这说明“完成”不是一个单纯的 <code>stop_reason === end_turn</code>，而是 Runtime、Hook、Task State 共同决定。</p>
+
+<h3>最终持久化什么？</h3>
+<p>QueryEngine 在 query 流中持续记录：</p>
+<ul>
+<li>assistant / user message。</li>
+<li>compact boundary。</li>
+<li>Tool / Hook attachment。</li>
+<li>usage / model usage。</li>
+<li>permission denials。</li>
+<li>file history snapshot。</li>
+</ul>
+
+<p>这些状态使下一次 <code>submitMessage()</code> 能在同一个 Conversation 上继续，而不是重新从空上下文开始。</p>
+
+<h3>0.11 的最终系统意义</h3>
+<p>这一阶段负责维护 Agent 的两个关键不变量：</p>
+<ol>
+<li><strong>Context Sustainability</strong>：任务再长，也必须通过 Microcompact / Full Compact / Recovery 保持在模型窗口内。</li>
+<li><strong>Completion Correctness</strong>：模型说“完成”只是候选结束点，Runtime 还要经过 Hook、任务状态、预算和错误恢复检查后才真正结束。</li>
+</ol>
+
+<h3>从源码角度重新概括整条链</h3>
+<pre><code class="language-text">User Input
+  ↓
+processUserInput()
+  ↓
+Context / Memory / Capability Construction
+  ↓
+QueryEngine.submitMessage()
+  ↓
+Transcript durability + ToolUseContext
+  ↓
+queryLoop()
+  ↓
+Claude semantic routing
+  ├─ text
+  ├─ Atomic Tool
+  └─ SkillTool → SKILL.md → Atomic Tools / Subagent
+  ↓
+Tool Runtime
+  ↓
+Schema → validateInput → PreHook → Permission → call()
+  ↓
+PostHook / FailureHook
+  ↓
+Concurrency-safe scheduling
+  ↓
+tool_result / contextModifier
+  ↓
+messages / Observation
+  ↓
+queryLoop() again
+  ↓
+Microcompact / AutoCompact / Recovery when needed
+  ↓
+PostSampling / Stop Hook
+  ↓
+Persist Session State
+  ↓
+Final Result
+</code></pre>
+
+<blockquote>
+<p><strong>Claude Code 的一次用户请求，本质上不是“一次 LLM API 调用”，而是一个由 QueryEngine 驱动的多轮状态事务：Memory 决定模型知道什么，Skill/Tool 机制决定模型能提出什么动作，Hooks 和 Permission 决定动作是否可被 Runtime 接受，Tool Runtime 负责产生可验证 Observation，Compact 负责让状态机可持续运行，Stop Hook 则负责确认什么时候才真正结束。</strong></p>
+</blockquote>
+
+
+<h2>文档定位与源码边界</h2>
+<p>本仓库不是 Anthropic 官方源码仓库，而是从公开发布物的 source map 恢复出的 TypeScript 源码树。当前 <code>package.json</code> 将版本标记为 <code>999.0.0-restored</code>；<code>src/</code> 下包含约 1,987 个 <code>.ts/.tsx</code> 文件、约 47.8 万行代码。它非常适合研究 Claude Code 的模块边界、数据流和工程设计，但不能把“源码中存在某个模块”等同于“当前恢复版本已能完整运行该功能”。</p>
+<p>阅读时需要区分三类实现：</p>
+<ol>
+<li><strong>完整主链路</strong>：CLI、REPL、QueryEngine、查询循环、工具调度、权限判断、上下文压缩等核心代码相对完整。</li>
+<li><strong>条件功能</strong>：大量模块受 <code>feature(...)</code>、环境变量、用户类型和远程配置控制，编译或运行时可能被排除。</li>
+<li><strong>恢复占位与外部端能力</strong>：少量文件是 shim、空实现或兼容壳；Desktop、Web、IDE 扩展本体也不都在此仓库中，本仓库主要包含它们与本地 Agent 内核之间的协议和适配层。</li>
+</ol>
+<p>因此，本文描述的是“源码呈现出的系统设计”，并在涉及恢复限制时明确标注。</p>
+<h2>一、总体架构</h2>
+<pre><code class="language-text">┌──────────────────────────────────────────────────────────────────────┐
+│ 第一层：入口层                                                       │
+│ CLI / 交互式终端 / Headless / SDK / IDE / Web·Desktop·Remote 适配   │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │ 标准化输入、会话参数、输出协议
+┌──────────────────────────────▼───────────────────────────────────────┐
+│ 第二层：运行时层                                                     │
+│ REPL / AppState / 输入队列 / Slash Commands / Hooks / 状态与生命周期 │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │ 构造一轮 Agent 请求
+┌──────────────────────────────▼───────────────────────────────────────┐
+│ 第三层：核心引擎                                                     │
+│ QueryEngine / queryLoop / 模型流 / Context / Compact / 恢复与重试    │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │ tool_use → 校验 → 授权 → 调度
+┌──────────────────────────────▼───────────────────────────────────────┐
+│ 第四层：工具与能力                                                   │
+│ Built-in Tools / MCP / Skill / Plugin / Agent / Command / Workflow   │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │ 文件、进程、网络、凭据、持久化
+┌──────────────────────────────▼───────────────────────────────────────┐
+│ 第五层：基础设施                                                     │
+│ Auth / Settings / Storage / Cache / Analytics / Bridge / Transport   │
+└──────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>五层不是五个完全隔离的进程，而是同一 TypeScript 应用中的逻辑分层。最关键的架构原则是：</p>
+<ul>
+<li><strong>入口可变，内核复用</strong>：交互式 REPL、<code>--print</code>、SDK 和远程会话最终复用相同的消息、查询和工具模型。</li>
+<li><strong>模型只提出动作，运行时决定能否执行</strong>：模型生成 <code>tool_use</code>，真正的参数校验、权限判断、并发策略和调用发生在本地工具管线。</li>
+<li><strong>会话是持续状态机，不是单次 API 请求</strong>：消息、文件快照、权限上下文、Token 使用、压缩边界和任务状态跨多轮保留。</li>
+<li><strong>上下文是主动管理的资源</strong>：系统通过缓存稳定、微压缩、完整压缩、上下文折叠和溢出恢复控制上下文窗口。</li>
+<li><strong>扩展统一收敛为工具或命令</strong>：MCP、Skill、Plugin、子 Agent 和工作流最后都会进入工具池、命令池或上下文构造过程。</li>
+</ul>
+<h2>二、一次请求的端到端逻辑</h2>
+<p>以用户在终端输入“检查项目并修复问题”为例，完整主链路如下：</p>
+<ol>
+<li><code>src/entrypoints/cli.tsx</code> 完成进程级初始化，然后进入 <code>src/main.tsx</code>。</li>
+<li><code>main.tsx</code> 解析 CLI 参数、设置工作目录、加载设置与权限规则、初始化模型、MCP、插件和会话恢复信息。</li>
+<li>交互模式通过 <code>src/replLauncher.tsx</code> 渲染 <code>src/screens/REPL.tsx</code>；无头模式则进入 <code>src/cli/print.ts</code>。</li>
+<li>输入先经过 <code>processUserInput</code>：解析 Slash Command、<code>@</code> 文件引用、附件、Skill、队列消息和输入元数据。</li>
+<li>运行时组装系统提示、用户上下文、Git 状态、<code>CLAUDE.md</code>/记忆文件、工具定义和 MCP 能力。</li>
+<li><code>QueryEngine.submitMessage()</code> 把新消息写入会话状态与 transcript，并建立本轮 <code>ToolUseContext</code>。</li>
+<li><code>query()</code>/<code>queryLoop()</code> 根据上下文预算决定是否先压缩，再调用模型流式接口。</li>
+<li>模型流返回文本、thinking、<code>tool_use</code> 或错误事件；文本可以立即呈现给 CLI/SDK。</li>
+<li>工具调用进入 <code>runTools()</code>：只读且并发安全的调用可批量并发，带副作用的调用按顺序执行。</li>
+<li>每个工具依次经过“工具查找 → Zod 参数校验 → 工具自定义校验 → Hook → 权限判断 → 调用 → 结果标准化”。</li>
+<li><code>tool_result</code> 被作为用户侧协议消息追加回对话，<code>queryLoop()</code> 再次调用模型；这个闭环持续到模型不再请求工具。</li>
+<li>Stop Hook、预算检查、压缩边界、持久化和统计收尾完成后，本轮结束；下一次输入继续复用同一会话状态。</li>
+</ol>
+<p>这条链路说明 Claude Code 的核心不是一个“大提示词”，而是一套围绕模型构建的事件循环、能力调度器和状态管理系统。</p>
+<hr>
+<h1>第一层：入口层</h1>
+<p>入口层负责把不同宿主的输入统一成会话请求，并把内核事件转换成宿主可消费的输出。它解决的是“从哪里进入、用什么协议交互”，而不是“Agent 如何推理”。</p>
+<h2>1.1 CLI 进程入口与启动编排</h2>
+<h3>核心文件</h3>
+<ul>
+<li><code>src/entrypoints/cli.tsx</code>：发布形态的 CLI 入口，安装全局错误处理并调用主程序。</li>
+<li><code>src/main.tsx</code>：参数解析和总启动编排中心。</li>
+<li><code>src/dev-entry.ts</code>：恢复仓库的开发入口；检查缺失导入，并在条件满足时转发到原始 CLI 启动链路。</li>
+<li><code>src/setup.ts</code>、<code>src/entrypoints/init.ts</code>：进程环境、初始化顺序及公共启动准备。</li>
+</ul>
+<h3>主要职责</h3>
+<p><code>main.tsx</code> 是入口层的“交通枢纽”，其职责远多于普通 CLI 参数解析：</p>
+<ul>
+<li>解析交互模式、<code>--print</code>、输入/输出格式、恢复/继续会话、模型、预算和权限模式。</li>
+<li>接收 <code>--allowed-tools</code>、<code>--disallowed-tools</code>、<code>--tools</code> 和 <code>--mcp-config</code>，形成初始能力边界。</li>
+<li>处理自定义 system prompt、追加 prompt、设置文件和 setting sources。</li>
+<li>执行迁移、启动遥测、缓存预热、会话恢复、远程连接、SSH、assistant/bridge 等分支。</li>
+<li>根据运行方式选择 REPL、Headless、远程会话或子命令处理器。</li>
+</ul>
+<p>启动阶段特别强调首轮延迟：源码中多处把 MCP、插件检查和上下文预取设计为延迟或并行任务，避免全部初始化阻塞 REPL 首次渲染和第一轮 TTFT。</p>
+<h2>1.2 交互式终端入口</h2>
+<h3>核心文件</h3>
+<ul>
+<li><code>src/replLauncher.tsx</code>：延迟导入并挂载 REPL。</li>
+<li><code>src/screens/REPL.tsx</code>：交互式终端的顶层控制器。</li>
+<li><code>src/components/</code>：消息列表、输入框、权限对话框、工具进度、任务面板等 UI。</li>
+<li><code>src/ink/</code>：终端渲染、布局、文本换行、输入输出和底层 Ink 兼容代码。</li>
+</ul>
+<h3>模块逻辑</h3>
+<p>REPL 同时承担展示和交互编排：</p>
+<ul>
+<li>接收用户输入，处理粘贴、图片、历史搜索、Vim 模式和快捷键。</li>
+<li>展示模型流、thinking、工具调用进度、权限请求和错误。</li>
+<li>维护输入队列，使用户可以在当前轮执行期间追加或中断请求。</li>
+<li>把 MCP 状态、插件状态、任务/Agent 状态和远程 Bridge 状态映射到 UI。</li>
+<li>在每轮开始时构造有效 system prompt 与 <code>ToolUseContext</code>，然后驱动查询循环。</li>
+</ul>
+<p>这里的 React/Ink 组件不是核心逻辑本身。真正的查询、工具和权限能力被放在独立模块中，因此无头模式可以复用它们。</p>
+<h2>1.3 Headless 与结构化 I/O</h2>
+<h3>核心文件</h3>
+<ul>
+<li><code>src/cli/print.ts</code>：<code>--print</code>/SDK 风格的非交互执行器。</li>
+<li><code>src/cli/structuredIO.ts</code>：结构化输入输出控制。</li>
+<li><code>src/cli/remoteIO.ts</code>：远程输入输出适配。</li>
+<li><code>src/cli/ndjsonSafeStringify.ts</code>：安全生成 NDJSON。</li>
+<li><code>src/cli/transports/</code>：WebSocket、SSE、Hybrid 和批量事件上传传输层。</li>
+</ul>
+<h3>模块逻辑</h3>
+<p>Headless 模式把 REPL 中的视觉交互替换为事件协议：</p>
+<ul>
+<li>输入可以是普通文本，也可以是流式 JSON。</li>
+<li>输出可包含初始化消息、用户回放、增量模型事件、工具进度、权限请求、压缩边界和最终结果。</li>
+<li><code>QueryEngine</code> 持有跨轮状态，SDK 调用方可以连续提交消息，而不是每次重建整个会话。</li>
+<li>权限无法通过终端对话框处理时，可交给外部 permission prompt tool 或控制通道。</li>
+</ul>
+<p>这种设计让 CLI 同时可以作为人类工具、脚本工具和更大 Agent 平台的本地执行内核。</p>
+<h2>1.4 SDK 入口</h2>
+<h3>核心文件</h3>
+<ul>
+<li><code>src/entrypoints/agentSdkTypes.ts</code>：SDK 暴露的查询、会话、工具和远程控制接口形状。</li>
+<li><code>src/entrypoints/sdk/coreTypes.ts</code>、<code>coreTypes.generated.ts</code>：消息、结果和会话核心类型。</li>
+<li><code>src/entrypoints/sdk/controlSchemas.ts</code>：控制请求的 Zod schema。</li>
+<li><code>src/entrypoints/sdk/toolTypes.ts</code>：工具类型定义。</li>
+</ul>
+<h3>模块逻辑</h3>
+<p>SDK 层把内核封装为可编程接口：</p>
+<ul>
+<li>创建/恢复/分叉会话并连续发送 prompt。</li>
+<li>构造 SDK 自定义工具或进程内 MCP Server。</li>
+<li>读取、列举、重命名和标记会话。</li>
+<li>订阅计划任务与远程控制事件。</li>
+<li>使用统一的 SDK 消息类型接收模型流、工具事件和结果。</li>
+</ul>
+<p>需要注意：恢复仓库中部分 SDK 文件更接近发布类型入口或占位实现；分析 SDK 时应结合 <code>cli/print.ts</code> 和 <code>QueryEngine.ts</code> 观察真实执行路径。</p>
+<h2>1.5 IDE、Desktop、Web 与 Remote 入口</h2>
+<h3>IDE 集成</h3>
+<ul>
+<li><code>src/hooks/useIDEIntegration.tsx</code>：REPL 与 IDE 状态的 React 集成。</li>
+<li><code>src/hooks/useIdeSelection.ts</code>、<code>useIdeConnectionStatus.ts</code>：IDE 选择和连接状态。</li>
+<li><code>src/services/mcp/vscodeSdkMcp.ts</code>：通过 MCP/SDK 接入 VS Code 能力。</li>
+<li><code>src/services/mcp/client.ts</code>：允许 IDE 专用 RPC 和工具发现。</li>
+</ul>
+<p>IDE 扩展本体不等同于本仓库；本仓库实现的是本地 Agent 如何发现 IDE、调用 IDE 暴露的 MCP/RPC 能力、发送 diff 或诊断请求。</p>
+<h3>Web/Desktop/Remote 适配</h3>
+<ul>
+<li><code>src/remote/RemoteSessionManager.ts</code>：远程会话生命周期、消息与权限响应。</li>
+<li><code>src/remote/SessionsWebSocket.ts</code>：远程 WebSocket 会话通道。</li>
+<li><code>src/remote/sdkMessageAdapter.ts</code>：SDK 消息与本地消息之间的转换。</li>
+<li><code>src/server/directConnectManager.ts</code>：Direct Connect 会话管理。</li>
+<li><code>src/bridge/</code>：本地进程与远端客户端之间的完整 Bridge 协议实现。</li>
+</ul>
+<p>Web 或 Desktop 前端本身可能在其他代码库中；这里的重点是“远端客户端如何把输入送入相同的 QueryEngine，并接收相同的模型和工具事件”。</p>
+<h2>1.6 入口层的输入输出契约</h2>
+<table>
+<thead>
+<tr>
+<th>入口</th>
+<th>输入</th>
+<th>输出</th>
+<th>主要适配点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>交互式 CLI</td>
+<td>键盘、粘贴、附件、Slash Command</td>
+<td>Ink 终端 UI</td>
+<td>人机交互、权限弹窗、实时进度</td>
+</tr>
+<tr>
+<td>Headless</td>
+<td>文本或 stream-json</td>
+<td>text/json/stream-json</td>
+<td>自动化和脚本执行</td>
+</tr>
+<tr>
+<td>SDK</td>
+<td>API 调用与 AsyncIterable</td>
+<td>SDKMessage 流</td>
+<td>嵌入其他应用</td>
+</tr>
+<tr>
+<td>IDE</td>
+<td>IDE MCP/RPC、选择区、诊断</td>
+<td>diff、状态、工具结果</td>
+<td>编辑器上下文和 UI 协同</td>
+</tr>
+<tr>
+<td>Remote/Bridge</td>
+<td>WebSocket/API 消息</td>
+<td>远程事件流</td>
+<td>跨设备会话与远程审批</td>
+</tr>
+</tbody></table>
+<hr>
+<h1>第二层：运行时层</h1>
+<p>运行时层负责“一次会话怎样活着”：它接收入口层事件，维护 UI/会话状态，处理命令与队列，并在适当时机启动或中断核心引擎。</p>
+<h2>2.1 REPL 运行时控制器</h2>
+<p><code>src/screens/REPL.tsx</code> 是交互模式的运行时壳。它将大量专用 Hook 组合起来，而不是把所有逻辑写成单一循环：</p>
+<ul>
+<li><code>useQueueProcessor</code>：消费排队的用户消息。</li>
+<li><code>useCommandQueue</code>：协调命令执行队列。</li>
+<li><code>useCancelRequest</code>：中断当前请求。</li>
+<li><code>useMergedTools</code>、<code>useMergedCommands</code>、<code>useMergedClients</code>：动态合并工具、命令和 MCP 客户端。</li>
+<li><code>useCanUseTool</code>：生成当前会话的权限决策函数。</li>
+<li><code>useSettingsChange</code>、<code>useSkillsChange</code>：监听配置和 Skill 变化。</li>
+<li><code>useRemoteSession</code>、<code>useReplBridge</code>：接入远程会话。</li>
+<li><code>useTasksV2</code>、<code>useTaskListWatcher</code>、<code>useSwarmInitialization</code>：任务和多 Agent 状态。</li>
+</ul>
+<p>这种 Hook 化设计将“终端 UI 状态”和“Agent 内核状态”解耦，但 REPL 仍是交互模式中决定何时提交、排队、打断和重绘的中心。</p>
+<h2>2.2 AppState 与 Store</h2>
+<h3>核心文件</h3>
+<ul>
+<li><code>src/state/AppStateStore.ts</code>：完整 <code>AppState</code> 类型和默认值。</li>
+<li><code>src/state/store.ts</code>：轻量订阅式 Store。</li>
+<li><code>src/state/AppState.tsx</code>：React Provider 和选择器 Hook。</li>
+<li><code>src/state/selectors.ts</code>：派生状态。</li>
+<li><code>src/state/onChangeAppState.ts</code>：状态变化的副作用与外部元数据映射。</li>
+</ul>
+<h3>状态内容</h3>
+<p><code>AppState</code> 不只是 UI state，它承载：</p>
+<ul>
+<li>工具权限上下文和附加工作目录。</li>
+<li>MCP 客户端、工具与资源连接状态。</li>
+<li>文件历史、内容替换和回滚相关状态。</li>
+<li>当前模型、thinking、fast mode、预算和用量。</li>
+<li>后台任务、子 Agent、团队和 teammate view。</li>
+<li>输入队列、通知、页脚、插件、IDE 与远程状态。</li>
+</ul>
+<p>Store 允许核心逻辑通过 <code>getAppState</code>/<code>setAppState</code> 工作，而不直接依赖 React。<code>QueryEngineConfig</code> 也使用这两个函数注入状态访问，从而支持 Headless/SDK。</p>
+<h2>2.3 输入预处理与命令路由</h2>
+<h3>核心文件</h3>
+<ul>
+<li><code>src/utils/processUserInput/</code>：用户输入标准化主链路。</li>
+<li><code>src/commands.ts</code>：命令注册、过滤和统一获取。</li>
+<li><code>src/commands/</code>：各 Slash Command 实现。</li>
+<li><code>src/hooks/useMergedCommands.ts</code>：内置命令、插件命令、Skill 命令的运行时合并。</li>
+</ul>
+<h3>处理顺序</h3>
+<p>输入不会直接发送给模型，而会先被拆解：</p>
+<ol>
+<li>识别本地 Slash Command；本地命令可能直接返回结果而不触发模型。</li>
+<li>解析 <code>@file</code>、图片、粘贴文本和其他附件。</li>
+<li>加载命中的 Skill、插件命令和动态上下文。</li>
+<li>注入队列消息、Hook 消息和系统提醒。</li>
+<li>根据命令结果调整模型、工具白名单、权限模式或消息历史。</li>
+<li>生成标准 <code>Message[]</code>，再交给 QueryEngine。</li>
+</ol>
+<p>这解释了为什么 Slash Command 可以改变后续会话行为：它处理的不是普通 prompt 字符串，而是运行时配置和消息状态。</p>
+<h2>2.4 Hook 生命周期</h2>
+<p>Hook 系统分为两类，不应混淆：</p>
+<ul>
+<li><code>src/hooks/</code> 中的 React Hook：管理 REPL 运行时、输入、通知、IDE、队列和 UI 状态。</li>
+<li>工具/Agent 生命周期 Hook：在模型调用、工具调用、压缩、停止等关键节点执行用户或插件配置的钩子。</li>
+</ul>
+<p>典型生命周期包括：</p>
+<ul>
+<li>Session/Startup：会话开始与初始化。</li>
+<li>UserPromptSubmit：用户输入提交前后。</li>
+<li>PreToolUse/PostToolUse/PostToolUseFailure：工具授权、执行和失败阶段。</li>
+<li>PostSampling：模型采样完成后。</li>
+<li>Stop/SubagentStop：主 Agent 或子 Agent 结束前。</li>
+<li>PreCompact：压缩之前允许注入额外指令。</li>
+</ul>
+<p>Hook 可以返回提示、阻断执行或提供额外上下文。源码在 <code>queryLoop()</code> 中防止错误响应与阻塞 Hook 形成无限重试，说明 Hook 被视为状态机的一部分，而非单纯日志回调。</p>
+<h2>2.5 中断、队列与生命周期一致性</h2>
+<p>运行时需要同时处理用户继续输入、工具仍在运行和远程控制消息：</p>
+<ul>
+<li><code>AbortController</code> 是统一中断信号。</li>
+<li>当前执行工具 ID 被保存在上下文中，便于 UI 和中断清理。</li>
+<li>若流式响应已经产生 <code>tool_use</code> 但执行被中断，系统会补齐合成 <code>tool_result</code>，保持 API 消息配对不变量。</li>
+<li>用户的新消息可以触发 interrupt，然后作为下一轮输入继续。</li>
+<li>Transcript 在调用模型前先记录用户消息，避免进程在首个模型响应前退出导致会话无法恢复。</li>
+</ul>
+<p>这套一致性机制保证“可恢复会话”的数据结构不会因中断停留在非法状态。</p>
+<hr>
+<h1>第三层：核心引擎</h1>
+<p>核心引擎负责模型调用与 Agent 闭环。这里要区分两个模块：<code>QueryEngine</code> 是会话级门面，<code>queryLoop</code> 是单轮内部可多次迭代的状态机。</p>
+<h2>3.1 QueryEngine：会话级门面</h2>
+<h3>核心文件</h3>
+<ul>
+<li><code>src/QueryEngine.ts</code></li>
+<li><code>src/query.ts</code></li>
+<li><code>src/query/config.ts</code></li>
+<li><code>src/query/deps.ts</code></li>
+<li><code>src/query/stopHooks.ts</code></li>
+<li><code>src/query/tokenBudget.ts</code></li>
+</ul>
+<h3>持有的长期状态</h3>
+<p>每个会话对应一个 <code>QueryEngine</code>，长期保存：</p>
+<ul>
+<li><code>mutableMessages</code>：完整会话消息。</li>
+<li><code>readFileState</code>：文件读取缓存/状态，用于工具一致性。</li>
+<li><code>totalUsage</code>：累计 Token 和成本。</li>
+<li><code>permissionDenials</code>：SDK 需要返回的拒绝记录。</li>
+<li><code>AbortController</code>：当前执行的中断控制。</li>
+<li>已发现 Skill 和已加载嵌套记忆路径。</li>
+</ul>
+<p><code>submitMessage()</code> 是一轮请求的入口。它完成 system prompt 获取、输入处理、transcript 写入、工具权限包装、SDK 初始化消息发出，然后调用 <code>query()</code> 消费内部 Agent 循环。</p>
+<h3>为什么使用门面类</h3>
+<p>如果直接从 REPL 调用 <code>query()</code>，Headless/SDK 就需要重复管理消息、使用量、恢复和权限。<code>QueryEngine</code> 把这些会话职责集中起来，使入口层只负责输入输出协议。</p>
+<h2>3.2 queryLoop：显式 Agent 状态机</h2>
+<p><code>src/query.ts</code> 中的 <code>query()</code> 创建初始 State，<code>queryLoop()</code> 通过 <code>while</code>/状态转换持续运行。State 包含：</p>
+<ul>
+<li>当前消息数组和 <code>ToolUseContext</code>。</li>
+<li>自动压缩跟踪状态。</li>
+<li>最大输出 Token 恢复次数。</li>
+<li>是否已经尝试 reactive compact。</li>
+<li>当前 turn count、stop-hook 状态和 transition reason。</li>
+<li>待完成的工具摘要和输出 Token override。</li>
+</ul>
+<p>一轮内部可能经历多次状态迁移：</p>
+<pre><code class="language-text">prepare_context
+  → model_stream
+  → tool_execution
+  → append_tool_results
+  → model_stream
+  → completed
+</code></pre>
+<p>也可能进入恢复分支：</p>
+<pre><code class="language-text">prompt_too_long
+  → context_collapse_drain
+  → reactive_compact
+  → retry
+
+max_output_tokens
+  → increase_output_limit
+  → continuation_message
+  → retry（有次数上限）
+
+model_overloaded
+  → fallback_model
+  → strip_incompatible_signatures
+  → retry
+</code></pre>
+<p>显式记录 <code>transition.reason</code> 的价值在于：恢复行为可防重入，避免“压缩失败—Hook 阻断—再次压缩”的死循环。</p>
+<h2>3.3 模型请求构造</h2>
+<h3>核心模块</h3>
+<ul>
+<li><code>src/services/api/claude.ts</code>：模型请求、流式响应和 API 适配。</li>
+<li><code>src/utils/queryContext.ts</code>：system/user/system context 的并行构造。</li>
+<li><code>src/constants/prompts.ts</code>：系统提示的分段来源。</li>
+<li><code>src/utils/systemPrompt.ts</code>：生成最终有效 system prompt。</li>
+<li><code>src/context.ts</code>：Git 状态、日期、<code>CLAUDE.md</code> 和记忆文件上下文。</li>
+</ul>
+<h3>上下文组成</h3>
+<p>最终请求不是单一字符串，大致由以下部分组成：</p>
+<ol>
+<li>默认或用户覆盖的 system prompt。</li>
+<li>根据工具、模型、权限模式和功能开关生成的动态系统段。</li>
+<li>工作目录的 <code>CLAUDE.md</code>、记忆文件和附加目录说明。</li>
+<li>会话启动时的 Git 分支、状态和最近提交快照。</li>
+<li>当前日期、输出风格、计划模式、团队/Agent 等运行时提示。</li>
+<li>历史消息、附件、压缩摘要和工具结果。</li>
+<li>当前可见工具的 JSON Schema。</li>
+</ol>
+<p>为了提高 prompt cache 命中率，工具在合并后按名称稳定排序；部分系统段也有独立缓存。动态但可后置的信息尽量不破坏前缀稳定性。</p>
+<h2>3.4 流式模型事件</h2>
+<p>模型调用通过 AsyncGenerator/AsyncIterable 输出事件。引擎可以在完整回复结束前：</p>
+<ul>
+<li>把文本增量交给 UI 或 SDK。</li>
+<li>收集 thinking 与签名块。</li>
+<li>识别完整 <code>tool_use</code>。</li>
+<li>在满足条件时提前启动 <code>StreamingToolExecutor</code>。</li>
+<li>记录请求 ID、使用量、缓存命中和错误类型。</li>
+</ul>
+<p>流式设计减少了“等模型完整生成后才开始工具”的串行等待。与此同时，引擎必须保证一个 assistant 消息里的工具块、后续结果和中断补偿保持协议一致。</p>
+<h2>3.5 Context 协调器</h2>
+<p>上下文管理分为“发现、组装、投影、预算”四类：</p>
+<ul>
+<li><strong>发现</strong>：扫描 <code>CLAUDE.md</code>、memory、Skill、插件、Git 和 IDE 信息。</li>
+<li><strong>组装</strong>：按 system/user/system context 和消息历史形成请求。</li>
+<li><strong>投影</strong>：对于 UI 保留完整历史，但 SDK/headless 可以投影已 snip 的视图。</li>
+<li><strong>预算</strong>：估算消息、工具结果、图片和输出预留所占 Token。</li>
+</ul>
+<p><code>src/context.ts</code> 会缓存会话初始 Git 状态与用户上下文，避免每次模型迭代重复执行昂贵 I/O。<code>CLAUDE.md</code> 的内容也会进入缓存，供权限分类器等模块复用，减少依赖环。</p>
+<h2>3.6 Compact：多级上下文压缩</h2>
+<h3>核心文件</h3>
+<ul>
+<li><code>src/services/compact/autoCompact.ts</code></li>
+<li><code>src/services/compact/compact.ts</code></li>
+<li><code>src/services/compact/microCompact.ts</code></li>
+<li><code>src/services/compact/sessionMemoryCompact.ts</code></li>
+<li><code>src/services/compact/apiMicrocompact.ts</code></li>
+<li><code>src/services/compact/postCompactCleanup.ts</code></li>
+<li><code>src/services/compact/prompt.ts</code></li>
+</ul>
+<h3>级别一：Microcompact</h3>
+<p>Microcompact 不总结整个对话，而是优先清理旧的、体积较大的工具结果和图片内容：</p>
+<ul>
+<li>估算各工具结果 Token。</li>
+<li>识别允许清理的工具类型。</li>
+<li>保留工具调用与结果配对结构，只把旧内容替换为清理标记。</li>
+<li>支持基于缓存和时间的触发策略。</li>
+</ul>
+<p>它的优势是成本低、对近期语义影响小，并能保持 prompt 前缀稳定。</p>
+<h3>级别二：Auto/Full Compact</h3>
+<p>当上下文接近模型窗口阈值时，<code>shouldAutoCompact()</code> 根据有效窗口、输出预留、缓冲区和连续失败次数决定是否压缩。完整压缩会：</p>
+<ol>
+<li>清理不适合摘要的图片或重复附件。</li>
+<li>调用专用 compact prompt 生成结构化对话摘要。</li>
+<li>写入 <code>compact_boundary</code>，记录压缩元数据。</li>
+<li>以“摘要 + 保留的近期消息”替换请求上下文。</li>
+<li>恢复最近读过的重要文件、Skill、计划和异步 Agent 状态附件。</li>
+<li>执行压缩后的缓存与临时状态清理。</li>
+</ol>
+<p>恢复附件很重要：只有摘要可能丢失精确代码，系统会在预算范围内重新附加最近读取的文件内容。</p>
+<h3>级别三：Partial/Session Memory Compact</h3>
+<p>部分压缩保留较早或较新的某一段原始消息，仅对选定区间摘要。Session Memory Compact 还会：</p>
+<ul>
+<li>计算应该保留的消息边界。</li>
+<li>调整边界以避免拆开 <code>tool_use</code>/<code>tool_result</code>。</li>
+<li>根据 Session Memory 配置生成可继续执行的压缩结果。</li>
+</ul>
+<h3>级别四：溢出恢复</h3>
+<p>如果 API 仍返回 prompt too long：</p>
+<ul>
+<li>先尝试提交已分阶段准备的 context collapse。</li>
+<li>再尝试 reactive compact。</li>
+<li>对媒体尺寸错误可执行去图片后的恢复。</li>
+<li>每种恢复有单次或次数限制；无法恢复时才把真实错误返回用户。</li>
+</ul>
+<h2>3.7 Stop Hook 与完成判定</h2>
+<p>“模型没有调用工具”并不一定立即结束：</p>
+<ul>
+<li>PostSampling Hook 在模型响应完成后异步执行。</li>
+<li>Stop Hook 可以允许结束、阻止继续或返回阻塞错误并要求模型再处理。</li>
+<li>API 错误不运行普通 Stop Hook，避免把错误当成有效回复反复重试。</li>
+<li>Token Budget 可以在模型看似完成时注入继续提示，直到满足预算策略或边际收益规则。</li>
+</ul>
+<p>因此，完成条件由模型输出、Hook、预算、错误状态和主动模式共同决定。</p>
+<hr>
+<h1>第四层：工具与能力</h1>
+<p>工具层把模型输出的抽象动作变成受控的本地或远程操作。它是 Claude Code 从“聊天”变成“编码 Agent”的关键。</p>
+<h2>4.1 Tool 抽象</h2>
+<h3>核心文件</h3>
+<ul>
+<li><code>src/Tool.ts</code>：Tool、ToolUseContext、ToolResult 等核心接口。</li>
+<li><code>src/tools.ts</code>：内置工具注册、过滤和工具池组装。</li>
+<li><code>src/utils/toolPool.ts</code>：去重、排序、Coordinator 过滤。</li>
+<li><code>src/services/tools/toolExecution.ts</code>：单工具执行管线。</li>
+<li><code>src/services/tools/toolOrchestration.ts</code>：多工具编排。</li>
+<li><code>src/services/tools/StreamingToolExecutor.ts</code>：流式提前执行。</li>
+</ul>
+<p>一个 Tool 通常提供：</p>
+<ul>
+<li><code>name</code>、描述和 prompt。</li>
+<li>Zod <code>inputSchema</code>。</li>
+<li><code>isEnabled()</code> 动态启用条件。</li>
+<li><code>isReadOnly()</code>/<code>isConcurrencySafe()</code> 调度属性。</li>
+<li><code>validateInput()</code> 业务校验。</li>
+<li><code>checkPermissions()</code> 工具级权限预判。</li>
+<li><code>call()</code> 实际执行逻辑和进度回调。</li>
+<li>UI 渲染与结果映射函数。</li>
+</ul>
+<p>Tool 定义同时服务于模型 schema、权限系统、执行器和 UI，因此它不是简单函数，而是能力元数据的聚合边界。</p>
+<h2>4.2 工具池组装</h2>
+<p><code>getAllBaseTools()</code> 建立候选内置工具；<code>getTools()</code> 再根据模式和功能开关过滤；<code>assembleToolPool()</code> 合并 MCP 工具。</p>
+<p>组装顺序包括：</p>
+<ol>
+<li>根据 REPL/simple/coordinator 等模式选取基础工具。</li>
+<li>应用 deny rules。</li>
+<li>调用每个工具的 <code>isEnabled()</code>。</li>
+<li>合并动态 MCP 工具。</li>
+<li>按名称去重，入口传入工具具有优先级。</li>
+<li>内置工具与 MCP 工具分别稳定排序，提高 prompt cache 稳定性。</li>
+<li>Coordinator 模式进一步缩小主协调器可见工具集合。</li>
+</ol>
+<p>模型只会看到最终工具池的 schema，但执行时仍会再次查找和授权，不能把“未发送 schema”当作唯一安全边界。</p>
+<h2>4.3 工具执行管线</h2>
+<p><code>runToolUse()</code> 的关键顺序如下：</p>
+<pre><code class="language-text">查找工具/兼容旧别名
+  → 检查 AbortSignal
+  → Zod schema 校验
+  → validateInput 业务校验
+  → PreToolUse Hook
+  → canUseTool / 工具权限判断
+  → call() 执行并流式报告进度
+  → 规范化 ToolResult
+  → PostToolUse 或 PostToolUseFailure Hook
+  → 生成与 tool_use_id 配对的 tool_result 消息
+</code></pre>
+<p>错误不会简单抛出并破坏循环，而会尽量转换成带 <code>is_error</code> 的 <code>tool_result</code> 返回模型，让模型有机会修正参数或换一种方案。</p>
+<h2>4.4 并发调度</h2>
+<p><code>runTools()</code> 将模型同一回复中的工具调用分批：</p>
+<ul>
+<li>连续的并发安全工具进入同一并发批次。</li>
+<li>非并发安全工具各自形成串行批次。</li>
+<li>并发上限默认为 10，可由环境变量调整。</li>
+<li>并发工具产生的 context modifier 先按 tool ID 暂存，再按原工具顺序应用，避免竞争导致状态不确定。</li>
+</ul>
+<p>典型只读操作如多个文件读取或搜索可以并行；编辑、Shell 和改变状态的工具需要保守串行。工具自身的 <code>isConcurrencySafe(input)</code> 可以根据具体参数动态判断。</p>
+<h2>4.5 内置工具模块</h2>
+<h3>文件与搜索</h3>
+<ul>
+<li><code>FileReadTool</code>：读取文本、图片等文件内容并维护读取状态。</li>
+<li><code>FileEditTool</code>：以精确替换方式修改文件。</li>
+<li><code>FileWriteTool</code>：创建或整体写入文件。</li>
+<li><code>GlobTool</code>、<code>GrepTool</code>：文件发现与内容搜索。</li>
+<li><code>NotebookEditTool</code>：Notebook 单元格级编辑。</li>
+<li><code>LSPTool</code>：语言服务诊断或导航。</li>
+</ul>
+<p>这些工具与文件快照、权限路径和 post-compact 文件恢复共同工作，不是彼此孤立的 I/O 包装器。</p>
+<h3>进程与终端</h3>
+<ul>
+<li><code>BashTool</code>、<code>PowerShellTool</code>：命令执行、输出流、超时和后台化。</li>
+<li><code>TaskOutputTool</code>、<code>TaskStopTool</code>：后台任务输出读取和终止。</li>
+<li><code>TerminalCaptureTool</code>：终端状态捕获。</li>
+<li><code>REPLTool</code>：受条件控制的 REPL 能力。</li>
+</ul>
+<p>Shell 工具的权限规则需要解析命令前缀、通配符和危险模式；Windows PowerShell 与 Bash 有各自的安全判断路径。</p>
+<h3>Web 与外部信息</h3>
+<ul>
+<li><code>WebSearchTool</code>、<code>WebFetchTool</code>：搜索和网页获取。</li>
+<li><code>WebBrowserTool</code>：条件启用的浏览器能力。</li>
+<li><code>MCPTool</code>、<code>ListMcpResourcesTool</code>、<code>ReadMcpResourceTool</code>：外部 MCP 能力入口。</li>
+</ul>
+<h3>规划、询问与任务</h3>
+<ul>
+<li><code>EnterPlanModeTool</code>、<code>ExitPlanModeTool</code>：计划模式状态转换。</li>
+<li><code>AskUserQuestionTool</code>：请求外部决策。</li>
+<li><code>TodoWriteTool</code>：传统待办记录。</li>
+<li><code>TaskCreate/Get/Update/List</code>：结构化任务系统。</li>
+<li><code>EnterWorktreeTool</code>、<code>ExitWorktreeTool</code>：隔离工作树生命周期。</li>
+</ul>
+<h3>Agent 与团队</h3>
+<ul>
+<li><code>AgentTool</code>：创建子 Agent/任务执行单元。</li>
+<li><code>SendMessageTool</code>：Agent 间通信。</li>
+<li><code>TeamCreateTool</code>、<code>TeamDeleteTool</code>：团队生命周期。</li>
+<li><code>VerifyPlanExecutionTool</code>：计划执行验证。</li>
+</ul>
+<p><code>src/coordinator/</code> 会限制协调器主 Agent 只保留编排所需能力，而 worker 使用适合执行的工具集合，形成“决策面/执行面”分离。</p>
+<h2>4.6 权限系统</h2>
+<h3>核心文件</h3>
+<ul>
+<li><code>src/hooks/useCanUseTool.tsx</code></li>
+<li><code>src/hooks/toolPermission/</code></li>
+<li><code>src/utils/permissions/permissions.ts</code></li>
+<li><code>src/utils/permissions/permissionSetup.ts</code></li>
+<li><code>src/utils/permissions/permissionsLoader.ts</code></li>
+<li><code>src/utils/permissions/PermissionUpdate.ts</code></li>
+<li><code>src/utils/permissions/shellRuleMatching.ts</code></li>
+</ul>
+<h3>决策层次</h3>
+<p>权限不是一个布尔开关，而是多来源规则合并：</p>
+<ol>
+<li>工具是否在最终工具池中。</li>
+<li>企业、项目、用户和本地设置中的 allow/ask/deny 规则。</li>
+<li>CLI 传入的 allowed/disallowed tools。</li>
+<li>当前权限模式，如默认、计划、自动或 bypass 类模式。</li>
+<li>工具自己的 <code>checkPermissions()</code>。</li>
+<li>路径是否位于工作目录或额外授权目录。</li>
+<li>交互处理器、Coordinator/Worker 处理器或远程权限桥。</li>
+</ol>
+<p>规则更新既可以只作用于当前会话，也可以持久化到设置。系统还检测危险权限、过宽 Shell 前缀和被 ask/deny 遮蔽的不可达 allow 规则。</p>
+<h2>4.7 MCP</h2>
+<h3>核心文件</h3>
+<ul>
+<li><code>src/services/mcp/config.ts</code>：多作用域配置加载、策略过滤、去重和启停。</li>
+<li><code>src/services/mcp/client.ts</code>：连接、工具/资源/命令发现和调用。</li>
+<li><code>src/services/mcp/auth.ts</code>：MCP OAuth。</li>
+<li><code>src/services/mcp/elicitationHandler.ts</code>：表单或 URL elicitation。</li>
+<li><code>src/tools/MCPTool/</code>：把 MCP 工具包装为统一 Tool。</li>
+</ul>
+<h3>逻辑</h3>
+<p>MCP 配置可来自项目、用户、企业、插件、SDK 或 claude.ai。系统会：</p>
+<ul>
+<li>规范化 server name 和工具名。</li>
+<li>展开环境变量并应用 allowlist/denylist 管理策略。</li>
+<li>按 stdio、HTTP、SSE、WebSocket 或进程内 transport 建立连接。</li>
+<li>批量发现 tools/resources/prompts。</li>
+<li>转换 MCP 内容块、图片、blob 和 structured content。</li>
+<li>将 MCP 工具纳入同一权限和执行管线。</li>
+<li>处理 OAuth、重连、超时、URL elicitation 和结果压缩。</li>
+</ul>
+<p>MCP 并不是绕过权限的旁路；它最终仍是 Tool，并受工具池与 <code>canUseTool</code> 约束。</p>
+<h2>4.8 Skill、Plugin、Agent 与 Command</h2>
+<h3>Skill</h3>
+<p>Skill 通常是带说明、资源和触发规则的可加载能力。<code>SkillTool</code> 负责显式调用，输入预处理也可根据命令或语义加载 Skill 内容。Skill 可来自内置目录、用户/项目目录、插件或远程搜索结果。</p>
+<h3>Plugin</h3>
+<p>Plugin 是更大的扩展包，可贡献：</p>
+<ul>
+<li>Slash Commands。</li>
+<li>Skills。</li>
+<li>Agents。</li>
+<li>Hooks。</li>
+<li>MCP Servers。</li>
+<li>设置与资源。</li>
+</ul>
+<p>运行时加载插件后，把贡献内容分别并入命令池、工具/Skill 上下文、Agent 定义和 Hook 注册表。</p>
+<h3>Agent</h3>
+<p>Agent 定义包含标识、适用条件、system prompt、工具限制、模型和权限信息。<code>AgentTool</code> 负责调度；worker 可在独立上下文或进程中运行，并通过任务、消息或团队状态回传结果。</p>
+<h3>Command</h3>
+<p>Command 是用户显式入口；有些完全本地执行，有些把结构化提示追加给模型。它可以改变模型、权限、模式、上下文或会话，而不一定调用外部工具。</p>
+<hr>
+<h1>第五层：基础设施</h1>
+<p>基础设施层向上提供稳定的身份、配置、持久化、缓存、观测和跨端传输。它决定系统是否可恢复、可管理和可诊断。</p>
+<h2>5.1 认证与凭据</h2>
+<h3>核心模块</h3>
+<ul>
+<li><code>src/cli/handlers/auth.ts</code>：登录、状态和登出命令。</li>
+<li><code>src/services/oauth/</code>：OAuth 流程。</li>
+<li><code>src/services/mcp/auth.ts</code>：MCP Server OAuth。</li>
+<li><code>src/utils/config.ts</code> 及凭据相关工具：API Key、Token 和配置读取。</li>
+</ul>
+<p>认证层需要支持 Anthropic 账户/API、第三方模型平台和 MCP OAuth。凭据不会作为普通 prompt 传给模型；请求适配层只获取调用所需的认证材料。远程 Bridge 还使用 JWT、work secret 和可信设备信息建立通道身份。</p>
+<h2>5.2 设置与配置分层</h2>
+<p>设置可能来自：</p>
+<ul>
+<li>命令行参数和环境变量。</li>
+<li>用户级、项目级和本地设置文件。</li>
+<li>企业托管设置。</li>
+<li>SDK 初始化请求。</li>
+<li>功能开关与远程实验配置。</li>
+</ul>
+<p>加载后并不是简单覆盖：权限规则、MCP Server 和插件等对象有各自的合并、去重和策略过滤逻辑。托管设置可以限制用户配置，例如仅允许企业批准的 MCP Server 或权限规则。</p>
+<h2>5.3 会话、Transcript 与文件历史</h2>
+<h3>核心文件</h3>
+<ul>
+<li><code>src/history.ts</code>：会话历史与消息恢复。</li>
+<li><code>src/utils/log.ts</code> 及 session storage 相关模块：transcript 写入和刷新。</li>
+<li><code>src/services/SessionMemory/</code>：会话记忆。</li>
+<li><code>src/assistant/sessionHistory.ts</code>、<code>sessionDiscovery.ts</code>：持久助手会话发现。</li>
+<li><code>src/utils/fileHistory.ts</code>、<code>src/hooks/useFileHistorySnapshotInit.ts</code>：文件快照与回滚。</li>
+</ul>
+<p>持久化对象至少包括：</p>
+<ul>
+<li>用户/助手/工具/系统消息。</li>
+<li>压缩边界和摘要元数据。</li>
+<li>文件修改前后的快照与内容替换。</li>
+<li>会话 ID、父工具 ID、Agent/任务关系。</li>
+<li>使用量、权限拒绝和部分运行元数据。</li>
+</ul>
+<p>用户消息在模型请求前写入 transcript，是为了解决“请求已接受但进程在首个响应前退出”的恢复缺口。文件历史则让 rewind/恢复不只回滚对话，还能恢复代码状态。</p>
+<h2>5.4 Cache 体系</h2>
+<p>源码中存在多类缓存，目标不同：</p>
+<ul>
+<li><strong>Prompt cache 稳定性</strong>：工具排序、系统段缓存和稳定前缀。</li>
+<li><strong>上下文发现缓存</strong>：Git 状态、<code>CLAUDE.md</code>、memory、Skill 与插件结果。</li>
+<li><strong>MCP 连接与发现缓存</strong>：连接、工具、资源和 prompt 列表。</li>
+<li><strong>文件读取状态</strong>：避免编辑建立在未知或过期内容上。</li>
+<li><strong>Microcompact cache edits</strong>：记录可清理块并在安全时提交。</li>
+<li><strong>远程配置缓存</strong>：减少启动阶段网络依赖。</li>
+</ul>
+<p>缓存不是统一 Key-Value 服务，而是分布在各边界的专用缓存。发生设置变化、cache breaker、压缩或连接重置时，对应模块显式失效。</p>
+<h2>5.5 Analytics、Telemetry 与诊断</h2>
+<h3>主要能力</h3>
+<ul>
+<li>启动阶段和首轮延迟 checkpoint。</li>
+<li>模型请求、Token、缓存和成本统计。</li>
+<li>工具调用、权限结果、错误分类和 MCP 类型。</li>
+<li>Query chain ID、depth 和子 Agent 关联。</li>
+<li>慢 Hook、慢工具阶段和异常日志。</li>
+</ul>
+<p>代码通常对工具名、URL 或错误内容做安全化再进入统计字段，区分可记录元数据和潜在代码/路径内容。诊断日志与产品分析事件也分开处理。</p>
+<h2>5.6 Bridge 传输层</h2>
+<h3>核心模块</h3>
+<ul>
+<li><code>src/bridge/bridgeMain.ts</code>、<code>remoteBridgeCore.ts</code>：Bridge 主循环。</li>
+<li><code>src/bridge/createSession.ts</code>、<code>sessionRunner.ts</code>：远程会话建立与执行。</li>
+<li><code>src/bridge/bridgeApi.ts</code>：后端 API 客户端。</li>
+<li><code>src/bridge/bridgeMessaging.ts</code>：消息发送。</li>
+<li><code>src/bridge/inboundMessages.ts</code>、<code>inboundAttachments.ts</code>：远端输入和附件。</li>
+<li><code>src/bridge/bridgePermissionCallbacks.ts</code>：远程权限审批。</li>
+<li><code>src/bridge/replBridge.ts</code>、<code>replBridgeTransport.ts</code>、<code>replBridgeHandle.ts</code>：本地 REPL 与 Bridge 的传输接口。</li>
+<li><code>src/bridge/jwtUtils.ts</code>、<code>trustedDevice.ts</code>、<code>workSecret.ts</code>：通道认证和信任。</li>
+</ul>
+<h3>逻辑</h3>
+<p>Bridge 将远端客户端视为另一个入口：</p>
+<ol>
+<li>本地创建或附着会话，取得 Bridge 标识和认证材料。</li>
+<li>建立 API/WebSocket 或轮询通道。</li>
+<li>远端 prompt 和附件被清洗、标准化后进入本地输入队列。</li>
+<li>本地模型流、工具状态和 UI 状态上传到远端。</li>
+<li>需要人工权限时，权限请求可发送到远端并等待回调。</li>
+<li>Flush gate、容量唤醒、轮询退避和状态指针处理断线与重连。</li>
+</ol>
+<p>Bridge 不重新实现 Agent；它只把远端输入输出接到同一个本地运行时，因此文件和 Shell 操作仍发生在本地受控环境。</p>
+<h2>5.7 Feature Gate 与产品变体</h2>
+<p><code>feature(&#39;...&#39;)</code>、<code>USER_TYPE</code>、环境变量和远程配置共同决定模块是否进入工具池、命令池或启动链路。它们分别解决：</p>
+<ul>
+<li>编译时裁剪与包体变体。</li>
+<li>内部/外部用户差异。</li>
+<li>本地实验或紧急开关。</li>
+<li>服务端灰度和模型配置。</li>
+</ul>
+<p>因此，阅读源码时应沿“注册点 → gate → <code>isEnabled()</code> → 权限 → 调用点”完整追踪，不能只看到文件就判定功能可用。</p>
+<hr>
+<h1>跨层关键机制</h1>
+<h2>3.1 消息是不变量载体</h2>
+<p>系统的核心数据不是字符串，而是带类型、UUID、父工具 ID 和元数据的 Message：</p>
+<ul>
+<li>user：用户输入、系统注入和 <code>tool_result</code>。</li>
+<li>assistant：模型文本、thinking 和 <code>tool_use</code>。</li>
+<li>system：初始化、状态、压缩边界和控制消息。</li>
+<li>progress：工具与 Hook 的增量进度。</li>
+</ul>
+<p>必须保持 <code>tool_use.id</code> 与 <code>tool_result.tool_use_id</code> 配对。中断、错误和并发执行都围绕这个不变量做补偿。</p>
+<h2>3.2 ToolUseContext 是跨层执行上下文</h2>
+<p><code>ToolUseContext</code> 将运行时和工具层连接起来，包含：</p>
+<ul>
+<li>当前消息、工具、命令、MCP 客户端和模型。</li>
+<li>权限上下文、工作目录和读取状态。</li>
+<li>AbortController、进度回调和在途工具 ID。</li>
+<li>文件历史、归属信息和应用状态更新函数。</li>
+<li>Agent ID、query source、query tracking 和预算。</li>
+</ul>
+<p>工具不需要直接引用 REPL，但仍能读取执行所需的全部上下文。</p>
+<h2>3.3 主 Agent 与子 Agent 复用同一内核</h2>
+<p>子 Agent 并不是另一套产品：</p>
+<ul>
+<li>使用 Agent Definition 构造不同 system prompt、工具集合和模型。</li>
+<li>通过相同 query/tool pipeline 执行。</li>
+<li>使用 <code>parent_tool_use_id</code>、agent ID、任务和消息通道关联父子关系。</li>
+<li>Coordinator 模式用工具过滤把主 Agent 变成编排器。</li>
+</ul>
+<p>复用保证权限、工具错误、MCP 和统计语义在主/子 Agent 间一致。</p>
+<h2>3.4 安全边界是分层防御</h2>
+<p>Claude Code 不依赖单一确认框：</p>
+<ul>
+<li>工具是否暴露给模型。</li>
+<li>deny rule 是否直接排除。</li>
+<li>schema 和业务参数是否有效。</li>
+<li>路径和命令是否满足规则。</li>
+<li>Hook 是否阻断。</li>
+<li>人工/远程审批是否允许。</li>
+<li>工具自身是否支持当前环境。</li>
+</ul>
+<p>任一层拒绝都应转成明确结果，而不是静默执行。</p>
+<hr>
+<h1>源码目录导航</h1>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>层级</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>src/main.tsx</code></td>
+<td>入口</td>
+<td>参数解析与启动总编排</td>
+</tr>
+<tr>
+<td><code>src/entrypoints/</code></td>
+<td>入口</td>
+<td>CLI、SDK、MCP 导出入口</td>
+</tr>
+<tr>
+<td><code>src/cli/</code></td>
+<td>入口/运行时</td>
+<td>Headless、结构化 I/O、传输与子命令</td>
+</tr>
+<tr>
+<td><code>src/screens/REPL.tsx</code></td>
+<td>运行时</td>
+<td>交互式会话控制器</td>
+</tr>
+<tr>
+<td><code>src/components/</code>、<code>src/ink/</code></td>
+<td>运行时</td>
+<td>终端 UI 与渲染基础</td>
+</tr>
+<tr>
+<td><code>src/state/</code>、<code>src/context/</code></td>
+<td>运行时</td>
+<td>应用状态和 React Context</td>
+</tr>
+<tr>
+<td><code>src/hooks/</code></td>
+<td>运行时</td>
+<td>队列、输入、权限、IDE、远程和通知</td>
+</tr>
+<tr>
+<td><code>src/QueryEngine.ts</code></td>
+<td>核心</td>
+<td>会话级查询门面</td>
+</tr>
+<tr>
+<td><code>src/query.ts</code>、<code>src/query/</code></td>
+<td>核心</td>
+<td>Agent 状态机、预算和停止逻辑</td>
+</tr>
+<tr>
+<td><code>src/services/api/</code></td>
+<td>核心/基础</td>
+<td>模型 API 与流式响应</td>
+</tr>
+<tr>
+<td><code>src/services/compact/</code></td>
+<td>核心</td>
+<td>上下文压缩和恢复</td>
+</tr>
+<tr>
+<td><code>src/tools/</code>、<code>src/tools.ts</code></td>
+<td>工具</td>
+<td>内置工具及注册表</td>
+</tr>
+<tr>
+<td><code>src/services/tools/</code></td>
+<td>工具</td>
+<td>校验、授权、执行和并发调度</td>
+</tr>
+<tr>
+<td><code>src/services/mcp/</code></td>
+<td>工具/基础</td>
+<td>MCP 配置、连接、发现、OAuth 和调用</td>
+</tr>
+<tr>
+<td><code>src/skills/</code>、<code>src/plugins/</code></td>
+<td>工具</td>
+<td>Skill 与插件扩展</td>
+</tr>
+<tr>
+<td><code>src/coordinator/</code>、<code>src/tasks/</code></td>
+<td>工具/运行时</td>
+<td>多 Agent 编排与任务状态</td>
+</tr>
+<tr>
+<td><code>src/utils/permissions/</code></td>
+<td>工具/基础</td>
+<td>权限规则、模式与 Shell 匹配</td>
+</tr>
+<tr>
+<td><code>src/history.ts</code>、SessionMemory</td>
+<td>基础</td>
+<td>会话持久化与恢复</td>
+</tr>
+<tr>
+<td><code>src/bridge/</code>、<code>src/remote/</code></td>
+<td>基础/入口</td>
+<td>远程控制和跨端传输</td>
+</tr>
+<tr>
+<td><code>shims/</code>、<code>vendor/</code></td>
+<td>兼容</td>
+<td>本地包 shim 与恢复兼容实现</td>
+</tr>
+</tbody></table>
+<h1>设计上的重点与代价</h1>
+<h2>优点</h2>
+<ul>
+<li>同一内核支持交互、脚本、SDK 和远程控制。</li>
+<li>工具调用有 schema、权限、Hook 和结果协议多层约束。</li>
+<li>AsyncGenerator 贯穿模型流与工具流，适合低延迟 UI。</li>
+<li>上下文管理不是一次性截断，而是多级、有恢复附件的策略。</li>
+<li>MCP/Skill/Plugin/Agent 最终收敛到少数统一抽象。</li>
+<li>Transcript、文件历史和压缩边界让长会话具备恢复能力。</li>
+</ul>
+<h2>复杂度代价</h2>
+<ul>
+<li><code>main.tsx</code>、<code>REPL.tsx</code>、<code>query.ts</code> 和 <code>cli/print.ts</code> 体量很大，承担大量分支编排。</li>
+<li>Feature gate 和产品变体让静态追踪变复杂。</li>
+<li>React UI 状态、核心状态和持久化状态之间需要大量同步代码。</li>
+<li>流式工具提前执行提高性能，也显著增加中断与消息配对复杂度。</li>
+<li>恢复源码中的 shim/占位文件会干扰“代码存在即完整”的判断。</li>
+</ul>
+<h1>建议的源码阅读顺序</h1>
+<ol>
+<li><code>src/entrypoints/cli.tsx</code> → <code>src/main.tsx</code>：理解启动分流。</li>
+<li><code>src/replLauncher.tsx</code> → <code>src/screens/REPL.tsx</code>：理解交互运行时。</li>
+<li><code>src/QueryEngine.ts</code>：理解一轮消息如何进入核心。</li>
+<li><code>src/query.ts</code>：理解模型—工具—模型闭环和恢复状态机。</li>
+<li><code>src/Tool.ts</code> → <code>src/tools.ts</code>：理解工具抽象与注册。</li>
+<li><code>src/services/tools/toolOrchestration.ts</code> → <code>toolExecution.ts</code>：理解并发、授权和结果。</li>
+<li><code>src/context.ts</code> → <code>src/services/compact/</code>：理解上下文与压缩。</li>
+<li><code>src/services/mcp/</code>、<code>src/skills/</code>、<code>src/plugins/</code>：理解扩展系统。</li>
+<li><code>src/utils/permissions/</code>：理解安全边界。</li>
+<li><code>src/history.ts</code>、<code>src/bridge/</code>：理解持久化与远程控制。</li>
+</ol>
+<h1>本地运行与验证</h1>
+<pre><code class="language-bash">bun install
+bun run version
+bun run dev
+</code></pre>
+<p>环境要求以 <code>package.json</code> 为准：Bun ≥ 1.3.5、Node.js ≥ 24。恢复仓库没有完整的一等测试脚本；修改核心模块后应至少执行版本启动检查，并针对受影响的命令、工具或 REPL 路径进行手工验证。</p>
+<h1>总结</h1>
+<p>Claude Code 可以概括为一个“以消息状态机为核心、以工具协议为执行边界、以上下文管理为续航系统”的本地 Agent Runtime：</p>
+<ul>
+<li>入口层让人、脚本、SDK、IDE 和远端客户端共享内核。</li>
+<li>运行时层维持会话、队列、命令、Hook 和 UI 生命周期。</li>
+<li>核心引擎在模型流、工具调用、压缩、错误恢复之间执行显式状态转换。</li>
+<li>工具层通过统一抽象把文件、Shell、Web、MCP、Skill、Plugin 和 Agent 纳入同一授权管线。</li>
+<li>基础设施层提供身份、配置、持久化、缓存、观测与 Bridge，使 Agent 能长期、跨端并可恢复地运行。</li>
+</ul>
+<p>真正值得借鉴的不是某一个隐藏命令，而是这些模块之间的契约：模型负责提出下一步，运行时负责维护不变量，权限系统决定边界，工具执行器产生可验证结果，上下文系统再把结果带回下一轮推理。</p>
+
+    </article>
+  </div>
+  <script>
+    const toc = document.getElementById('toc');
+    const seen = new Map();
+    const headings = [...document.querySelectorAll('article h1, article h2, article h3')];
+
+    headings.forEach((heading, index) => {
+      const base = heading.textContent.trim().toLowerCase()
+        .replace(/[^\p{L}\p{N}]+/gu, '-')
+        .replace(/^-|-$/g, '') || `section-${index + 1}`;
+      const count = seen.get(base) || 0;
+      seen.set(base, count + 1);
+      heading.id = count ? `${base}-${count + 1}` : base;
+
+      const link = document.createElement('a');
+      link.href = `#${heading.id}`;
+      link.textContent = heading.textContent;
+      if (heading.tagName === 'H2') link.className = 'sub';
+      if (heading.tagName === 'H3') link.className = 'sub3';
+      toc.appendChild(link);
+    });
+
+    const navLinks = [...toc.querySelectorAll('a')];
+    const setActive = () => {
+      let current = headings[0];
+      const offset = 100;
+      for (const heading of headings) {
+        if (heading.getBoundingClientRect().top <= offset) current = heading;
+        else break;
+      }
+      navLinks.forEach(link => {
+        link.classList.toggle('active', link.getAttribute('href') === `#${current.id}`);
+      });
+    };
+
+    window.addEventListener('scroll', setActive, { passive:true });
+    window.addEventListener('resize', setActive);
+    setActive();
+  </script>
+</body>
+</html>

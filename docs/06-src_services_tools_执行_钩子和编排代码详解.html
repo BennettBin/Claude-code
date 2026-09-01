@@ -1,0 +1,1287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Code src/services/tools 四个 TypeScript 脚本详细解析</title>
+<style>
+:root{
+  --bg:#f5f7fb; --panel:#ffffff; --text:#1f2937; --muted:#667085;
+  --border:#e4e7ec; --blue:#2457d6; --blue-soft:#eef4ff;
+  --green:#067647; --green-soft:#ecfdf3; --amber:#93370d; --amber-soft:#fffaeb;
+  --red:#b42318; --red-soft:#fef3f2; --code:#101828; --code-text:#f2f4f7;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0; background:var(--bg); color:var(--text); line-height:1.72;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;
+}
+.container{max-width:1180px;margin:0 auto;padding:40px 24px 80px}
+.hero,.card{
+  background:var(--panel); border:1px solid var(--border); border-radius:18px;
+  box-shadow:0 7px 24px rgba(16,24,40,.045)
+}
+.hero{padding:36px 40px;background:linear-gradient(135deg,#fff 0%,#f2f6ff 100%)}
+.card{padding:28px 32px;margin-top:22px}
+h1{font-size:35px;line-height:1.25;margin:0 0 14px}
+h2{font-size:27px;margin:42px 0 14px;padding-left:13px;border-left:5px solid var(--blue)}
+h3{font-size:21px;margin:30px 0 10px}
+h4{font-size:17px;margin:22px 0 8px}
+p{margin:9px 0}
+.lead{font-size:18px;color:#344054}
+.small{font-size:14px;color:var(--muted)}
+.kicker{font-size:13px;letter-spacing:.08em;text-transform:uppercase;font-weight:700;color:var(--muted)}
+.note,.tip,.warn,.danger{
+  padding:14px 17px;border-radius:11px;margin:16px 0
+}
+.note{background:var(--blue-soft);border:1px solid #c7d7fe}
+.tip{background:var(--green-soft);border:1px solid #abefc6;color:var(--green)}
+.warn{background:var(--amber-soft);border:1px solid #fedf89;color:var(--amber)}
+.danger{background:var(--red-soft);border:1px solid #fecdca;color:var(--red)}
+pre{
+  background:var(--code);color:var(--code-text);padding:18px 20px;border-radius:12px;
+  overflow:auto;line-height:1.55;font-size:14px
+}
+code{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace}
+p code,li code,td code{background:#f2f4f7;padding:2px 6px;border-radius:5px;font-size:.95em}
+table{width:100%;border-collapse:collapse;margin:17px 0;font-size:14.5px}
+th,td{border:1px solid var(--border);padding:11px 13px;text-align:left;vertical-align:top}
+th{background:#f9fafb}
+ul,ol{padding-left:25px}
+li{margin:5px 0}
+a{color:var(--blue);text-decoration:none}
+a:hover{text-decoration:underline}
+.toc{columns:2;column-gap:36px}
+.toc a{display:block;padding:4px 0;break-inside:avoid}
+.file-title{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.badge{font-size:12px;font-weight:700;border-radius:999px;padding:4px 9px;background:#f2f4f7;color:#475467}
+.badge.core{background:#eaf2ff;color:#1849a9}
+.badge.scheduler{background:#ecfdf3;color:#067647}
+.badge.hook{background:#fff6ed;color:#b54708}
+.flow-label{font-weight:700;color:#344054}
+.footer{text-align:center;color:var(--muted);font-size:13px;margin-top:36px}
+hr{border:none;border-top:1px solid var(--border);margin:28px 0}
+</style>
+</head>
+<body>
+<div class="container">
+
+<section class="hero">
+<div class="kicker">Claude Code Source Analysis</div>
+<h1><code>src/services/tools</code> 四个 TypeScript 脚本详细解析</h1>
+<p class="lead">
+本文针对 BennettBin/Claude-code 恢复源码中的 <code>src/services/tools</code> 目录，
+逐个分析 <code>StreamingToolExecutor.ts</code>、<code>toolExecution.ts</code>、
+<code>toolHooks.ts</code> 和 <code>toolOrchestration.ts</code>。
+重点不是逐行翻译，而是解释每个脚本的整体结构、主要类/函数、内部调用关系、
+脚本之间如何协作，以及它们在整个 Claude Code Agent/Tool Runtime 中承担什么系统职责。
+</p>
+<div class="note">
+<strong>一句话总览：</strong>
+这四个文件共同组成 Claude Code Tool Runtime 的核心执行层：
+<code>toolExecution.ts</code> 是“单次 Tool Call 执行内核”，
+<code>toolHooks.ts</code> 是“Hook/Permission 适配层”，
+<code>toolOrchestration.ts</code> 是“非流式批量调度器”，
+<code>StreamingToolExecutor.ts</code> 是“流式、有状态的并发调度器”。
+</div>
+<p class="small">
+说明：BennettBin/Claude-code 不是 Anthropic 官方开源仓库，而是根据公开发布物/source map 恢复出的源码树。
+本文描述的是该恢复源码中可以直接观察到的实现结构。
+</p>
+</section>
+
+<section class="card">
+<h2>0. 目录整体架构</h2>
+<table>
+<thead>
+<tr><th>脚本</th><th>规模（raw 源码）</th><th>核心抽象</th><th>系统职责</th></tr>
+</thead>
+<tbody>
+<tr>
+<td><code>toolExecution.ts</code></td><td>约 1660 行</td>
+<td><code>runToolUse()</code>、<code>checkPermissionsAndCallTool()</code></td>
+<td>完成一次 Tool Call 从查找、校验、Hook、权限、执行到结果/错误封装的完整生命周期。</td>
+</tr>
+<tr>
+<td><code>toolHooks.ts</code></td><td>约 622 行</td>
+<td>Pre/Post/Failure Hooks、Hook Permission Resolution</td>
+<td>把底层 Hook 系统输出转换成 Tool Runtime 能理解的 permission、updatedInput、context、stop 等控制信号。</td>
+</tr>
+<tr>
+<td><code>toolOrchestration.ts</code></td><td>约 180 行</td>
+<td><code>runTools()</code>、batch partition</td>
+<td>模型一轮输出结束后，对多个 Tool Call 做并发安全分组，并按并发/串行方式调度。</td>
+</tr>
+<tr>
+<td><code>StreamingToolExecutor.ts</code></td><td>约 500 行</td>
+<td><code>StreamingToolExecutor</code> 状态机</td>
+<td>模型仍在 Streaming 时提前启动完整 Tool Call，并管理队列、并发 barrier、abort、progress 与有序结果输出。</td>
+</tr>
+</tbody>
+</table>
+
+<h3>四个文件之间最重要的调用关系</h3>
+<pre><code>                         query.ts
+                            │
+             ┌──────────────┴──────────────┐
+             │                             │
+      非 Streaming 路径               Streaming 路径
+             │                             │
+             ▼                             ▼
+     toolOrchestration.ts          StreamingToolExecutor.ts
+         runTools()                     addTool()
+             │                           processQueue()
+             │                               │
+             └──────────────┬────────────────┘
+                            ▼
+                     toolExecution.ts
+                       runToolUse()
+                            │
+                            ▼
+                streamedCheckPermissionsAndCallTool()
+                            │
+                            ▼
+                checkPermissionsAndCallTool()
+                   │                    │
+                   │                    │
+                   ▼                    ▼
+             toolHooks.ts            Tool.call()
+        runPreToolUseHooks()             │
+ resolveHookPermissionDecision()         │
+                   │                     │
+                   └──────────┬──────────┘
+                              ▼
+                         Tool Result
+                              │
+                 ┌────────────┴────────────┐
+                 ▼                         ▼
+       runPostToolUseHooks()    runPostToolUseFailureHooks()
+                 │                         │
+                 └────────────┬────────────┘
+                              ▼
+                       Message / tool_result
+                              │
+                              ▼
+                         query.ts 下一轮</code></pre>
+
+<div class="tip">
+如果只记住一个层次：<strong>调度器负责“何时执行哪些 Tool”；
+<code>runToolUse()</code> 负责“某一个 Tool 到底怎么执行”；
+Hook 层负责“执行前后有哪些外部策略可以介入”。</strong>
+</div>
+
+<h3>目录</h3>
+<div class="toc">
+<a href="#execution">1. toolExecution.ts</a>
+<a href="#hooks">2. toolHooks.ts</a>
+<a href="#orchestration">3. toolOrchestration.ts</a>
+<a href="#streaming">4. StreamingToolExecutor.ts</a>
+<a href="#cross">5. 四个脚本的完整调用链</a>
+<a href="#comparison">6. 职责边界对比</a>
+<a href="#system">7. 在 Agent Harness 中的系统定位</a>
+<a href="#sources">8. 源码入口</a>
+</div>
+</section>
+
+<section class="card" id="execution">
+<div class="file-title">
+<h2>1. <code>toolExecution.ts</code></h2>
+<span class="badge core">单次 Tool Call 执行内核</span>
+</div>
+
+<h3>1.1 脚本的核心作用</h3>
+<p>
+<code>toolExecution.ts</code> 是四个文件中最核心、体量最大的一层。
+它并不负责决定多个 Tool 之间“谁先谁后”，而是负责回答：
+<strong>给我一个已经由模型产生的 <code>tool_use</code>，如何把它安全、可观测、可恢复地执行成一个 <code>tool_result</code>？</strong>
+</p>
+
+<p>从职责上看，它把一个 Tool Call 拆成完整的执行 pipeline：</p>
+<pre><code>tool_use
+   ↓
+Tool lookup / alias fallback
+   ↓
+MCP metadata 识别
+   ↓
+Abort 检查
+   ↓
+Zod Schema Validation
+   ↓
+Tool-specific validateInput()
+   ↓
+Input preprocessing / backfill
+   ↓
+PreToolUse Hooks
+   ↓
+Hook Permission + Rule Permission + User Permission
+   ↓
+tool.call()
+   ↓
+Progress forwarding
+   ↓
+Result mapping / telemetry / tracing
+   ↓
+PostToolUse Hooks
+   ↓
+tool_result / Attachment / contextModifier
+
+异常路径：
+tool.call() exception
+   ↓
+错误分类 / MCP auth state 更新
+   ↓
+PostToolUseFailure Hooks
+   ↓
+error tool_result</code></pre>
+
+<h3>1.2 整体结构</h3>
+<table>
+<thead><tr><th>大致区域</th><th>结构</th><th>作用</th></tr></thead>
+<tbody>
+<tr><td>文件头</td><td>大量 imports</td><td>连接 Tool abstraction、权限系统、Hooks、MCP、Analytics、OTel tracing、消息封装、ToolSearch 等。</td></tr>
+<tr><td>前部 helper</td><td><code>classifyToolError()</code> 等</td><td>处理 telemetry-safe 错误分类、权限来源映射、MCP server metadata、图片 ID 等辅助逻辑。</td></tr>
+<tr><td>主入口</td><td><code>runToolUse()</code></td><td>接收单个 <code>ToolUseBlock</code>，处理 Tool 查找、未知 Tool、取消，并把执行委托给下一层。</td></tr>
+<tr><td>流式桥接</td><td><code>streamedCheckPermissionsAndCallTool()</code></td><td>把 progress callback + 最终结果统一包装成 AsyncIterable，供上层 scheduler 流式消费。</td></tr>
+<tr><td>Schema Hint</td><td><code>buildSchemaNotSentHint()</code></td><td>当 deferred tool schema 没被送到模型、导致参数类型错误时，提示模型先通过 ToolSearch 加载工具。</td></tr>
+<tr><td>执行主体</td><td><code>checkPermissionsAndCallTool()</code></td><td>完成 Schema、validateInput、PreHook、Permission、实际调用、PostHook、结果/异常处理。</td></tr>
+</tbody>
+</table>
+
+<h3>1.3 主要函数解析</h3>
+
+<h4>A. <code>classifyToolError(error)</code></h4>
+<p>
+这个函数用于把真实异常转换成<strong>适合 telemetry 记录、又不会意外泄露敏感路径或内容</strong>的错误类别。
+它优先使用专门的 TelemetrySafeError 信息；文件系统错误倾向记录 <code>ENOENT</code>、
+<code>EACCES</code> 等 errno code；已知 Error 可使用稳定的 error name；无法安全确认时退回通用错误类型。
+</p>
+<p><strong>系统意义：</strong>这是 Tool Runtime 的 observability 防线。Tool 执行错误可以统计，但日志不能直接把用户代码、文件路径或命令全部当错误标签上报。</p>
+
+<h4>B. Permission source helpers</h4>
+<p>
+<code>ruleSourceToOTelSource()</code> 与 <code>decisionReasonToOTelSource()</code>
+把各种内部 permission 来源统一映射为 telemetry 中稳定的来源 vocabulary。
+例如 session 级允许、持久设置允许、hook、classifier、config 等。
+</p>
+<p><strong>系统意义：</strong>权限不是简单 true/false。系统还需要回答“为什么允许/拒绝”，用于安全审计和行为分析。</p>
+
+<h4>C. MCP helper functions</h4>
+<ul>
+<li><code>findMcpServerConnection()</code>：根据 <code>mcp__...</code> Tool 名称反查 MCP Server Connection。</li>
+<li><code>getMcpServerType()</code>：识别 stdio / sse / http / ws / sdk 等 transport 类型。</li>
+<li><code>getMcpServerBaseUrlFromToolName()</code>：获取适合日志记录的 MCP endpoint metadata。</li>
+</ul>
+<p><strong>系统意义：</strong>MCP Tool 最终仍然进入统一 Tool Runtime，但 Tool Execution 会额外带上 MCP transport / server metadata，用于 telemetry、错误处理和 auth 状态维护。</p>
+
+<h4>D. <code>runToolUse()</code>：单调用公共入口</h4>
+<p>这是整个目录中最重要的函数之一。上层的两个 scheduler 最终都调用它。</p>
+<ol>
+<li>通过 <code>findToolByName()</code> 在当前可用 Tool Pool 中查找 Tool。</li>
+<li>若没找到，会检查 base tools 中的 deprecated alias，用于兼容旧 transcript 中的旧工具名。</li>
+<li>提取 message/request/MCP metadata。</li>
+<li>未知 Tool：直接生成带 <code>tool_use_id</code> 的 error <code>tool_result</code>，而不是让整个 Agent Runtime crash。</li>
+<li>检查当前 query abort signal；若已取消，生成取消结果。</li>
+<li>正常情况下进入 <code>streamedCheckPermissionsAndCallTool()</code>。</li>
+<li>最外围 catch 把意外 runtime exception 再封装成 Tool Error Message。</li>
+</ol>
+
+<div class="tip">
+<strong>关键架构点：</strong><code>runToolUse()</code> 是所有 Tool 类型的统一入口。
+Read、Edit、Bash、Skill、MCP Tool 等虽然内部 <code>call()</code> 不同，但都共享同一套前后处理协议。
+</div>
+
+<h4>E. <code>streamedCheckPermissionsAndCallTool()</code></h4>
+<p>
+这个函数本身不负责核心权限逻辑，而是一个<strong>Async Streaming Adapter</strong>。
+源码注释也明确承认这是一种桥接做法：底层执行函数通过 callback 发 progress，
+最终又返回结果数组；这里用一个 Stream 把两者统一成一个 AsyncIterable。
+</p>
+<pre><code>checkPermissionsAndCallTool()
+    │
+    ├── onToolProgress(progress)
+    │        ↓
+    │    stream.enqueue(progress message)
+    │
+    └── Promise&lt;final messages&gt;
+             ↓
+        stream.enqueue(final messages)
+             ↓
+          stream.done()</code></pre>
+
+<p><strong>系统意义：</strong>上层 scheduler 不需要知道某个 Tool 的 progress callback 细节，
+只要统一 <code>for await</code> 消费更新即可。</p>
+
+<h4>F. <code>buildSchemaNotSentHint()</code></h4>
+<p>
+这个函数处理一个非常 Claude Code 特有的场景：ToolSearch / deferred tools。
+如果某个 Tool 虽然本地存在，但它的 schema 并没有真正出现在送给模型的工具集合中，
+模型可能把 array、number、boolean 等参数错误地产生为 string。
+当 Zod validation 失败时，该函数会根据历史 discovered-tool set 判断是否属于这种情况，
+并在错误结果中提示模型先加载 Tool schema 再重试。
+</p>
+<p><strong>系统意义：</strong>这不是单纯“参数校验失败”，而是把失败原因重新反馈给模型，帮助 Agent 自修复。</p>
+
+<h4>G. <code>checkPermissionsAndCallTool()</code>：执行主体</h4>
+<p>这是整个单 Tool 生命周期最复杂的函数。可以按以下阶段理解：</p>
+
+<table>
+<thead><tr><th>阶段</th><th>执行内容</th><th>为什么需要</th></tr></thead>
+<tbody>
+<tr><td>1. Schema Validation</td><td><code>tool.inputSchema.safeParse(input)</code></td><td>阻止 LLM 生成的错误参数直接进入业务函数。</td></tr>
+<tr><td>2. Tool Validation</td><td><code>tool.validateInput?.()</code></td><td>Schema 只能校验结构；Tool 自己可以校验路径、范围、业务约束等语义。</td></tr>
+<tr><td>3. Speculative Check</td><td>Bash permission classifier 可提前启动</td><td>让 classifier 与 Hooks / permission UI 准备并行，降低延迟。</td></tr>
+<tr><td>4. Input Preparation</td><td>处理内部字段、backfill observable input</td><td>让 Hook/Permission 看见必要派生字段，同时避免无意改变最终 transcript。</td></tr>
+<tr><td>5. Pre Hooks</td><td><code>runPreToolUseHooks()</code></td><td>允许外部策略修改输入、允许/拒绝/ask、补充上下文或停止 continuation。</td></tr>
+<tr><td>6. Permission</td><td><code>resolveHookPermissionDecision()</code></td><td>把 Hook 决策、settings rules、需要交互的 Tool、用户确认统一起来。</td></tr>
+<tr><td>7. Denial path</td><td>生成 error result；特定 classifier denial 还可执行 PermissionDenied hooks</td><td>拒绝也是一个可反馈给模型的观察结果，而不是程序异常。</td></tr>
+<tr><td>8. Execute</td><td><code>tool.call()</code></td><td>真正执行 Tool 实现，并转发 progress。</td></tr>
+<tr><td>9. Result Mapping</td><td>结构化结果、API ToolResult block、结果大小、文件扩展名等</td><td>把异构 Tool 输出统一成模型下一轮能消费的消息格式。</td></tr>
+<tr><td>10. Post Hooks</td><td><code>runPostToolUseHooks()</code></td><td>成功后允许追加上下文、停止后续、修改 MCP output 等。</td></tr>
+<tr><td>11. Error path</td><td>错误分类、MCP auth 更新、failure hooks</td><td>使错误可恢复、可观测，并允许外部 Hook 在失败后介入。</td></tr>
+</tbody>
+</table>
+
+<h3>1.4 <code>tool.call()</code> 在调用链中的位置</h3>
+<pre><code>runToolUse()
+  ↓
+streamedCheckPermissionsAndCallTool()
+  ↓
+checkPermissionsAndCallTool()
+  ↓
+Schema + validateInput
+  ↓
+PreToolUse Hooks
+  ↓
+Permission
+  ↓
+tool.call(...)    ← 真正执行具体 Tool 的位置
+  ↓
+PostToolUse Hooks / Failure Hooks
+  ↓
+MessageUpdateLazy[]</code></pre>
+
+<p>
+这说明 Tool Runtime 与具体 Tool 实现是分离的：
+<code>toolExecution.ts</code> 负责共性的执行治理，
+而 <code>Tool.call()</code> 才负责 Bash/Read/Edit/MCP 各自的实际能力。
+</p>
+
+<h3>1.5 Context Modifier 的产生</h3>
+<p>
+Tool 的调用结果可能带有 <code>contextModifier</code>。
+<code>toolExecution.ts</code> 不负责最终决定多个 modifier 的应用顺序，
+而是把 modifier 放进 <code>MessageUpdateLazy</code> 返回给 scheduler。
+因此上下文更新的“生成”和“调度应用”被拆成两层：
+</p>
+<pre><code>Tool.call()
+   ↓
+result.contextModifier
+   ↓
+toolExecution.ts 封装
+   ↓
+toolOrchestration / StreamingToolExecutor
+   ↓
+按调度语义修改 ToolUseContext</code></pre>
+
+<h3>1.6 成功与失败路径</h3>
+<p><strong>成功：</strong></p>
+<pre><code>tool.call()
+  ↓
+map result
+  ↓
+telemetry / OTel
+  ↓
+runPostToolUseHooks()
+  ↓
+tool_result + hook attachments + context modifier</code></pre>
+
+<p><strong>失败：</strong></p>
+<pre><code>tool.call() throws
+  ↓
+classify / log
+  ↓
+MCP auth error → connection state = needs-auth（如果适用）
+  ↓
+runPostToolUseFailureHooks()
+  ↓
+error tool_result + hook messages</code></pre>
+
+<h3>1.7 该脚本在整个系统中的作用</h3>
+<div class="note">
+<strong>系统定位：</strong><code>toolExecution.ts</code> 是 Tool Runtime 的“事务执行内核”。
+它保证不管上层使用 batch scheduler 还是 streaming scheduler，
+每一个 Tool Call 都执行同一套 Schema、Hook、Permission、Telemetry、Result 与 Error 协议。
+</div>
+
+<p>
+如果没有这一层，上层 Agent Loop 就必须分别为 Bash、Read、Edit、MCP 重复实现权限、错误、Hook 和消息封装，
+系统会迅速失去一致性。
+</p>
+
+<p class="small">
+源码入口：
+<a href="https://github.com/BennettBin/Claude-code/blob/main/src/services/tools/toolExecution.ts">toolExecution.ts</a>
+</p>
+</section>
+
+<section class="card" id="hooks">
+<div class="file-title">
+<h2>2. <code>toolHooks.ts</code></h2>
+<span class="badge hook">Hook / Permission 适配层</span>
+</div>
+
+<h3>2.1 脚本的核心作用</h3>
+<p>
+<code>toolHooks.ts</code> 位于“底层 Hook engine”和“Tool Execution pipeline”之间。
+它不是 Tool Scheduler，也不是直接执行 shell hook command 的底层实现；
+它更像一个<strong>Hook 语义适配器</strong>：
+把 <code>executePreToolHooks()</code>、<code>executePostToolHooks()</code> 等底层输出，
+转换成 Tool Runtime 可以消费的强类型事件。
+</p>
+
+<pre><code>底层 Hook Engine（utils/hooks）
+        │
+        ▼
+   toolHooks.ts
+        │
+        ├── permission result
+        ├── updated input
+        ├── additional context
+        ├── stop / prevent continuation
+        ├── attachment / progress
+        └── updated MCP output
+        │
+        ▼
+ toolExecution.ts</code></pre>
+
+<h3>2.2 整体结构</h3>
+<table>
+<thead><tr><th>结构</th><th>主要函数/类型</th><th>作用</th></tr></thead>
+<tbody>
+<tr><td>输出类型</td><td><code>PostToolUseHooksResult&lt;Output&gt;</code></td><td>定义 Post Hook 能产生普通消息或修改后的 MCP Tool Output。</td></tr>
+<tr><td>成功后 Hook</td><td><code>runPostToolUseHooks()</code></td><td>Tool 成功后执行 PostToolUse Hook 并翻译结果。</td></tr>
+<tr><td>失败后 Hook</td><td><code>runPostToolUseFailureHooks()</code></td><td>Tool exception / abort 后执行 Failure Hook。</td></tr>
+<tr><td>权限合并</td><td><code>resolveHookPermissionDecision()</code></td><td>把 Hook allow/ask/deny 与 rule-based permission、交互要求、canUseTool 合并。</td></tr>
+<tr><td>执行前 Hook</td><td><code>runPreToolUseHooks()</code></td><td>允许 Hook 在真正 Tool Call 前修改参数、决定权限、注入 context 或阻止执行。</td></tr>
+</tbody>
+</table>
+
+<h3>2.3 <code>runPreToolUseHooks()</code></h3>
+<p>这是 Tool 执行之前最重要的外部扩展点。它可以产生多种事件：</p>
+<table>
+<thead><tr><th>事件</th><th>语义</th></tr></thead>
+<tbody>
+<tr><td><code>message</code></td><td>Hook progress、attachment 等普通消息。</td></tr>
+<tr><td><code>hookPermissionResult</code></td><td>Hook 给出 allow / ask / deny。</td></tr>
+<tr><td><code>hookUpdatedInput</code></td><td>Hook 修改 Tool 输入，但不直接决定权限。</td></tr>
+<tr><td><code>preventContinuation</code></td><td>即使当前 Tool 执行完，也可以阻止 Agent 后续继续。</td></tr>
+<tr><td><code>stopReason</code></td><td>为停止 continuation 提供原因。</td></tr>
+<tr><td><code>additionalContext</code></td><td>把 Hook 产生的信息注入会话上下文。</td></tr>
+<tr><td><code>stop</code></td><td>Hook 被中断时停止当前执行流。</td></tr>
+</tbody>
+</table>
+
+<p>调用关系：</p>
+<pre><code>checkPermissionsAndCallTool()
+        ↓
+runPreToolUseHooks()
+        ↓
+executePreToolHooks()   ← 更底层 Hook Engine
+        ↓
+把结果翻译为强类型事件
+        ↓
+toolExecution.ts switch(result.type)</code></pre>
+
+<h3>2.4 Hook 如何修改 Tool 参数？</h3>
+<p>如果 Hook 返回 <code>updatedInput</code>：</p>
+<ul>
+<li>若同时返回 permissionBehavior，updatedInput 与该 Hook permission decision 一起进入后续 permission resolution。</li>
+<li>若没有 permissionBehavior，则产生 <code>hookUpdatedInput</code>，让正常权限流程继续，但后续看到的是修改后的参数。</li>
+</ul>
+
+<p>因此 PreToolUse Hook 不只是“通知机制”，它是真正的<strong>execution interceptor</strong>。</p>
+
+<h3>2.5 <code>resolveHookPermissionDecision()</code>：最重要的安全不变量</h3>
+<div class="warn">
+源码明确强调：<strong>Hook 的 allow 并不意味着无条件绕过 <code>settings.json</code> 中的 deny/ask 规则。</strong>
+</div>
+
+<p>它处理的主要情况：</p>
+<ol>
+<li>Hook = allow：先考虑 Tool 是否必须用户交互，以及当前 runtime 是否强制要求 <code>canUseTool</code>。</li>
+<li>即便 Hook allow，也继续检查 rule-based permissions。</li>
+<li>若 rule = deny，deny 覆盖 Hook allow。</li>
+<li>若 rule = ask，仍然需要 permission dialog / canUseTool。</li>
+<li>Hook = ask：将 Hook 原因作为 forceDecision 传入正常交互流程。</li>
+<li>没有 Hook decision：完全走普通 permission flow。</li>
+</ol>
+
+<pre><code>PreToolUse Hook
+      │
+      ├── deny ──────────────→ deny
+      │
+      ├── ask ───────────────→ canUseTool(...)
+      │
+      └── allow
+            │
+            ▼
+    checkRuleBasedPermissions()
+            │
+       ┌────┼────┐
+       │    │    │
+      deny ask  null
+       │    │    │
+       ▼    ▼    ▼
+      deny prompt allow</code></pre>
+
+<p><strong>系统意义：</strong>Hook 是扩展机制，而不是一个可以意外突破核心安全策略的后门。</p>
+
+<h3>2.6 <code>runPostToolUseHooks()</code></h3>
+<p>Tool 成功后执行。主要处理：</p>
+<ul>
+<li>Hook 普通 message / progress。</li>
+<li>blocking error attachment。</li>
+<li><code>preventContinuation</code> 与 stop reason。</li>
+<li>additional context。</li>
+<li>对 MCP Tool 的 <code>updatedMCPToolOutput</code>。</li>
+<li>Hook cancel / Hook execution error 的 telemetry 与 attachment。</li>
+</ul>
+
+<p>
+其中 <strong>MCP output 可被 PostToolUse Hook 修改</strong> 是一个很重要的系统能力：
+外部策略层可以在远程 MCP Tool 输出进入模型上下文前做转换或治理。
+</p>
+
+<h3>2.7 <code>runPostToolUseFailureHooks()</code></h3>
+<p>当 Tool 执行抛出异常或被中断时，<code>toolExecution.ts</code> 会调用它。</p>
+<p>它允许 Failure Hook：</p>
+<ul>
+<li>看到 Tool 名称、input、error 与是否 user interrupt。</li>
+<li>产生额外上下文。</li>
+<li>产生 Hook attachment / blocking information。</li>
+<li>将失败事件接入日志、自动修复、外部通知或组织策略。</li>
+</ul>
+
+<h3>2.8 为什么单独拆成 <code>toolHooks.ts</code>？</h3>
+<p>
+如果所有 Hook 语义都堆进 <code>toolExecution.ts</code>，
+单 Tool 内核会更加庞大，而且 permission 语义容易在 REPL、主 Query Loop 等不同调用环境发生漂移。
+源码注释特别指出 <code>resolveHookPermissionDecision()</code> 还会被其他路径复用，
+目的就是让权限语义保持一致。
+</p>
+
+<h3>2.9 该脚本在整个系统中的作用</h3>
+<div class="note">
+<strong>系统定位：</strong><code>toolHooks.ts</code> 是 Tool Runtime 的 policy/interception layer。
+它让企业策略、自定义 Hook、权限、额外上下文和执行后处理可以介入 Tool Call，
+同时保持底层 Tool 实现与这些策略解耦。
+</div>
+
+<p class="small">
+源码入口：
+<a href="https://github.com/BennettBin/Claude-code/blob/main/src/services/tools/toolHooks.ts">toolHooks.ts</a>
+</p>
+</section>
+
+<section class="card" id="orchestration">
+<div class="file-title">
+<h2>3. <code>toolOrchestration.ts</code></h2>
+<span class="badge scheduler">Batch Scheduler</span>
+</div>
+
+<h3>3.1 脚本的核心作用</h3>
+<p>
+<code>toolOrchestration.ts</code> 是经典的<strong>模型完成一轮输出后</strong>的批量 Tool Scheduler。
+它接收这一轮的全部 <code>ToolUseBlock[]</code>，判断每一次调用是否 concurrency-safe，
+然后将连续安全调用组成 batch，并决定并发还是串行执行。
+</p>
+
+<pre><code>一轮 Claude response
+       ↓
+ToolUseBlock[]
+       ↓
+partitionToolCalls()
+       ↓
+┌───────────────────────┐
+│ safe batch            │ → concurrent
+├───────────────────────┤
+│ unsafe single call    │ → serial / exclusive
+├───────────────────────┤
+│ safe batch            │ → concurrent
+└───────────────────────┘
+       ↓
+每个调用最终仍走 runToolUse()</code></pre>
+
+<h3>3.2 整体结构</h3>
+<table>
+<thead><tr><th>函数/类型</th><th>作用</th></tr></thead>
+<tbody>
+<tr><td><code>getMaxToolUseConcurrency()</code></td><td>读取最大并发度，默认 10。</td></tr>
+<tr><td><code>MessageUpdate</code></td><td>调度层返回 message + 当前 newContext。</td></tr>
+<tr><td><code>runTools()</code></td><td>总入口：partition → concurrent/serial → context modifier merge。</td></tr>
+<tr><td><code>Batch</code></td><td>保存 <code>isConcurrencySafe</code> 与该 batch 的 Tool blocks。</td></tr>
+<tr><td><code>partitionToolCalls()</code></td><td>根据每次 invocation 的 <code>isConcurrencySafe(input)</code> 分批。</td></tr>
+<tr><td><code>runToolsSerially()</code></td><td>一个一个调用 <code>runToolUse()</code>，modifier 立即影响下一 Tool。</td></tr>
+<tr><td><code>runToolsConcurrently()</code></td><td>使用 async generator 并发工具 <code>all()</code> 驱动多个 <code>runToolUse()</code>。</td></tr>
+<tr><td><code>markToolUseAsComplete()</code></td><td>维护 in-progress Tool ID 集合。</td></tr>
+</tbody>
+</table>
+
+<h3>3.3 <code>getMaxToolUseConcurrency()</code></h3>
+<p>最大并发来自：</p>
+<pre><code>CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY</code></pre>
+<p>未配置时默认值为 10。</p>
+<p><strong>系统作用：</strong>即使模型一次生成大量并发安全调用，也避免无限创建进程、文件 I/O 或网络/MCP 请求。</p>
+
+<h3>3.4 <code>partitionToolCalls()</code></h3>
+<p>这是这个脚本最关键的算法。</p>
+
+<p>对每个 Tool Call：</p>
+<ol>
+<li>从当前 Tool Pool 找到 Tool。</li>
+<li>先用 <code>inputSchema.safeParse()</code> 解析参数。</li>
+<li>只有 Schema 成功时才调用 <code>tool.isConcurrencySafe(parsedInput.data)</code>。</li>
+<li>若判断函数异常，则保守返回 false。</li>
+<li>当前调用 safe 且上一个 batch 也 safe：加入上一 batch。</li>
+<li>否则新建 batch。</li>
+</ol>
+
+<pre><code>Read A  safe ─┐
+Read B  safe ─┼── Batch 1 concurrent
+Grep C  safe ─┘
+
+Edit D unsafe ─── Batch 2 serial/exclusive
+
+Read E  safe ─┐
+Read F  safe ─┘── Batch 3 concurrent</code></pre>
+
+<div class="warn">
+<strong>注释与实际实现的差异：</strong>
+源码注释仍写“read-only tools / non-read-only tool”，
+但真实判断条件已经是 <code>isConcurrencySafe(input)</code>。
+阅读时应以实际代码为准：并不是所有 read-only 一定 safe，也不是只能靠静态 Tool 类型判断。
+</div>
+
+<h3>3.5 为什么是连续 batch，而不是把所有 safe Tool 抽出来？</h3>
+<p>例如模型输出：</p>
+<pre><code>Read A
+Edit B
+Read C</code></pre>
+<p>不能重排为：</p>
+<pre><code>Read A + Read C
+Edit B</code></pre>
+<p>因为 <code>Read C</code> 可能就是为了读取 Edit B 修改后的结果。</p>
+<p>因此 scheduler 保留模型 Tool Call 的原始顺序语义，unsafe Tool 自然形成一个 barrier。</p>
+
+<h3>3.6 <code>runToolsSerially()</code></h3>
+<p>
+串行路径对每一个 Tool 依次执行 <code>runToolUse()</code>。
+如果一个 Tool 返回 <code>contextModifier</code>，它会立刻修改 <code>currentContext</code>，
+因此下一个 Tool 使用的是新 Context。
+</p>
+
+<pre><code>Tool A
+  ↓
+runToolUse(A)
+  ↓
+contextModifier A
+  ↓
+currentContext = A(currentContext)
+  ↓
+Tool B 使用新 Context</code></pre>
+
+<p><strong>系统意义：</strong>保证依赖前序状态的 mutation Tool / context-changing Tool 有明确 happens-before 关系。</p>
+
+<h3>3.7 <code>runToolsConcurrently()</code></h3>
+<p>
+并发路径使用项目里的 async generator <code>all()</code>，而不是简单 <code>Promise.all()</code>。
+每个并发分支内部仍执行同一个 <code>runToolUse()</code>，
+从而可以继续向上游 yield progress 和结果。
+</p>
+
+<p>最大并发度由前述配置控制。</p>
+
+<h3>3.8 并发 batch 的 Context Modifier 如何处理？</h3>
+<p>
+这是该脚本一个非常关键但容易忽略的细节。
+并发 Tool 执行过程中，不能让先返回的 Tool 立即修改其他仍在运行 Tool 的 Context，
+否则结果会取决于“哪个网络请求先完成”，产生非确定性。
+</p>
+
+<p>所以 <code>runTools()</code> 会：</p>
+<ol>
+<li>先按 <code>toolUseID</code> 暂存 concurrent batch 中产生的 modifiers。</li>
+<li>并发 batch 全部结束后，再按原始 <code>blocks</code> 顺序应用 modifiers。</li>
+</ol>
+
+<pre><code>Concurrent:
+A ───── finish second → modifier A
+B ─ finish first      → modifier B
+
+不是按完成时间：
+B modifier → A modifier
+
+而是按原始模型顺序：
+A modifier → B modifier</code></pre>
+
+<p><strong>系统意义：</strong>并发执行获得性能，但 Context 合并保持 deterministic semantics。</p>
+
+<h3>3.9 该脚本在整个系统中的作用</h3>
+<div class="note">
+<strong>系统定位：</strong><code>toolOrchestration.ts</code> 是传统 batch Tool Scheduler。
+它解决的是“模型一次产生多个 Tool Call 后如何安全地利用并发”，
+而不是重复实现 Tool 的 Schema、Permission 或 Hook。
+这些全部委托给 <code>runToolUse()</code>。
+</div>
+
+<p class="small">
+源码入口：
+<a href="https://github.com/BennettBin/Claude-code/blob/main/src/services/tools/toolOrchestration.ts">toolOrchestration.ts</a>
+</p>
+</section>
+
+<section class="card" id="streaming">
+<div class="file-title">
+<h2>4. <code>StreamingToolExecutor.ts</code></h2>
+<span class="badge scheduler">Streaming Stateful Scheduler</span>
+</div>
+
+<h3>4.1 为什么还需要另一个 Scheduler？</h3>
+<p>
+传统 <code>runTools()</code> 要等模型一整轮 streaming response 完成，收集到所有 <code>ToolUseBlock</code> 后再执行。
+但模型可能已经早早生成了一个完整的 Read/Bash Tool Call，
+此时继续等待后续 token 会浪费 latency。
+</p>
+
+<p><code>StreamingToolExecutor</code> 的目标是：</p>
+<div class="tip">
+<strong>某个 Tool Call 一旦在模型流中完整出现，就尽可能立刻启动，而不是等待整轮模型输出结束。</strong>
+</div>
+
+<pre><code>传统：
+Claude streaming ████████████████████
+                                Tool A █████
+                                       Tool B █████
+
+Streaming executor：
+Claude streaming ████████████████████
+         Tool A █████
+               Tool B █████</code></pre>
+
+<h3>4.2 整体结构</h3>
+<p>文件主要由一个状态化类和几个内部类型构成：</p>
+
+<table>
+<thead><tr><th>结构</th><th>作用</th></tr></thead>
+<tbody>
+<tr><td><code>MessageUpdate</code></td><td>streaming scheduler 对外产生 message / newContext。</td></tr>
+<tr><td><code>ToolStatus</code></td><td><code>queued → executing → completed → yielded</code> 状态机。</td></tr>
+<tr><td><code>TrackedTool</code></td><td>保存 ToolUseBlock、assistant message、并发安全性、promise、results、progress、modifiers。</td></tr>
+<tr><td><code>StreamingToolExecutor</code></td><td>队列调度、执行、abort、progress、结果排序的主体。</td></tr>
+<tr><td><code>markToolUseAsComplete()</code></td><td>维护 in-progress ID 集合。</td></tr>
+</tbody>
+</table>
+
+<h3>4.3 类的主要状态字段</h3>
+<table>
+<thead><tr><th>字段</th><th>作用</th></tr></thead>
+<tbody>
+<tr><td><code>tools</code></td><td>按模型接收顺序保存所有 TrackedTool，是顺序语义的基础。</td></tr>
+<tr><td><code>toolUseContext</code></td><td>当前 Tool Runtime Context，非并发 Tool 的 modifier 可以更新它。</td></tr>
+<tr><td><code>hasErrored</code></td><td>标记是否出现会触发 sibling cancellation 的错误。</td></tr>
+<tr><td><code>erroredToolDescription</code></td><td>为被取消 sibling 生成可理解的错误说明。</td></tr>
+<tr><td><code>siblingAbortController</code></td><td>用于 Bash error 时快速取消 sibling subprocess。</td></tr>
+<tr><td><code>discarded</code></td><td>模型 streaming fallback 时废弃当前 executor 的结果。</td></tr>
+<tr><td><code>progressAvailableResolve</code></td><td>当 progress 到达时唤醒等待中的 <code>getRemainingResults()</code>。</td></tr>
+</tbody>
+</table>
+
+<h3>4.4 <code>addTool()</code></h3>
+<p>当 <code>query.ts</code> 在模型流中拿到完整 <code>tool_use</code> block，就调用该方法。</p>
+
+<p>它执行：</p>
+<ol>
+<li>查找 Tool definition。</li>
+<li>未知 Tool：直接构造 completed error result。</li>
+<li>Schema parse。</li>
+<li>调用 <code>isConcurrencySafe(parsedInput)</code>；异常时按 false。</li>
+<li>创建状态为 <code>queued</code> 的 TrackedTool。</li>
+<li>调用 <code>processQueue()</code> 尝试立即启动。</li>
+</ol>
+
+<h3>4.5 <code>canExecuteTool()</code>：核心并发规则</h3>
+<p>逻辑可以抽象为：</p>
+<pre><code>如果当前没有 Tool executing：
+    新 Tool 可以执行
+
+否则：
+    只有“新 Tool 是 safe”
+    且“所有正在 executing 的 Tool 都 safe”
+    才能执行</code></pre>
+
+<p>因此：</p>
+<table>
+<thead><tr><th>当前执行</th><th>新 Tool</th><th>结果</th></tr></thead>
+<tbody>
+<tr><td>无</td><td>safe / unsafe</td><td>可以启动</td></tr>
+<tr><td>全部 safe</td><td>safe</td><td>可并发启动</td></tr>
+<tr><td>全部 safe</td><td>unsafe</td><td>等待</td></tr>
+<tr><td>存在 unsafe</td><td>safe</td><td>等待</td></tr>
+<tr><td>存在 unsafe</td><td>unsafe</td><td>等待</td></tr>
+</tbody>
+</table>
+
+<p>
+这意味着 unsafe Tool 获得了<strong>exclusive access</strong>。
+它既不会和前面的 Tool 并发，也阻止后面的 Tool 越过自己。
+</p>
+
+<h3>4.6 <code>processQueue()</code></h3>
+<p>
+遍历 <code>tools</code> 队列，对 queued Tool 调用 <code>canExecuteTool()</code>。
+如果可以则 <code>executeTool()</code>。
+如果当前遇到一个不能执行的 unsafe Tool，则停止继续向后调度。
+</p>
+
+<div class="tip">
+这使 unsafe Tool 成为一个 <strong>Concurrency Barrier</strong>：
+后面的 safe Read 也不能跨过一个正在等待的 Edit/Bash mutation。
+</div>
+
+<h3>4.7 <code>discard()</code></h3>
+<p>
+当模型 streaming 请求发生 fallback/retry 时，之前已经开始执行的 Tool Call
+与旧 <code>tool_use_id</code> 属于失败的 assistant response。
+如果这些结果继续流出，就会形成 orphan <code>tool_result</code>。
+</p>
+<p>
+所以 <code>query.ts</code> 会调用 <code>discard()</code>，
+queued Tool 不再启动；in-progress Tool 最终收到 synthetic streaming-fallback error。
+然后 query 创建一个全新的 executor。
+</p>
+
+<h3>4.8 Abort / Synthetic Error 体系</h3>
+<p>该类区分几类取消原因：</p>
+<ul>
+<li><code>sibling_error</code>：并行 sibling（特别是 Bash）失败。</li>
+<li><code>user_interrupted</code>：用户中断/拒绝。</li>
+<li><code>streaming_fallback</code>：当前模型流被废弃并重试。</li>
+</ul>
+
+<p><code>createSyntheticErrorMessage()</code> 会为未真正完成的 Tool 补一个合法 <code>tool_result</code>。</p>
+
+<p><strong>为什么重要：</strong>Anthropic Tool Use 对话协议要求 tool_use 与 tool_result 成对。
+即使任务被中断，Runtime 也不能留下只有 tool_use 没有对应 result 的不完整 transcript。</p>
+
+<h3>4.9 <code>getToolInterruptBehavior()</code> 与 interruptible state</h3>
+<p>
+Tool 可以定义中断行为 <code>cancel</code> 或 <code>block</code>。
+如果没有定义或判断异常，源码保守地按 <code>block</code>。
+<code>updateInterruptibleState()</code> 会根据当前 executing tools
+更新 UI/runtime 是否存在“可中断 Tool”。
+</p>
+
+<h3>4.10 <code>executeTool()</code>：Streaming Scheduler 的实际执行器</h3>
+<p>主要流程：</p>
+<pre><code>status = executing
+  ↓
+登记 in-progress ID
+  ↓
+检查是否已经 abort/discard
+  ↓
+创建 per-tool child AbortController
+  ↓
+runToolUse(...)
+  ↓
+for await updates
+  ├── progress → pendingProgress
+  ├── normal result → messages
+  ├── contextModifier → 暂存
+  └── error result → 判断是否触发 sibling cancellation
+  ↓
+status = completed
+  ↓
+Promise finally → processQueue() 启动后续 Tool</code></pre>
+
+<h3>4.11 为什么 Bash error 会取消 sibling，而 Read error 不会？</h3>
+<p>
+源码明确把 Bash 作为特殊情况。
+原因是多条 shell command 往往存在隐式依赖链：
+前一步创建目录/编译失败后，后续命令继续运行可能无意义甚至产生误导结果。
+</p>
+
+<p>而 Read/WebFetch 等调用通常彼此独立，一个失败不应该自动杀掉全部 sibling。</p>
+
+<pre><code>Bash A error
+   ↓
+hasErrored = true
+   ↓
+siblingAbortController.abort("sibling_error")
+   ↓
+其他相关 subprocess 快速取消</code></pre>
+
+<h3>4.12 Context Modifier 在 Streaming 路径中的处理</h3>
+<p>
+这里与 <code>toolOrchestration.ts</code> 有一个值得注意的差异。
+源码注释明确说当前 streaming executor 暂不支持 concurrent tools 的 context modifiers。
+只有非 concurrency-safe Tool 返回 modifier 时，才直接更新 executor 内的 <code>toolUseContext</code>。
+</p>
+
+<div class="warn">
+<strong>对比：</strong>
+传统 batch scheduler 会缓存 concurrent batch 的 modifiers，batch 完成后按原始 Tool 顺序应用；
+Streaming executor 当前则不应用 concurrent Tool 的 modifiers。
+这是两个 scheduler 在 Context merge 能力上的一个实际差异。
+</div>
+
+<h3>4.13 <code>getCompletedResults()</code></h3>
+<p>非阻塞地取出已经完成但尚未 yield 的结果。</p>
+<p>两个关键规则：</p>
+<ul>
+<li>Progress message 不需要等最终结果，尽快向上游 yield。</li>
+<li>普通结果要维护必要的接收顺序；如果遇到正在执行的 unsafe Tool，会停止向后 yield。</li>
+</ul>
+
+<p>
+这体现了一个重要区分：<strong>执行可以并发，结果暴露给 Agent Runtime 时仍需要保持语义顺序。</strong>
+</p>
+
+<h3>4.14 <code>getRemainingResults()</code></h3>
+<p>
+模型响应结束后，<code>query.ts</code> 会调用它等待剩余 Tool。
+它反复：
+</p>
+<ol>
+<li><code>processQueue()</code> 尝试启动能运行的 queued Tool。</li>
+<li>yield 已完成结果。</li>
+<li>如果还有 executing Tool 但暂无完成结果/进度，则 <code>Promise.race()</code> 等待任意 Tool 完成或 progress 到达。</li>
+<li>直到所有 Tool 进入 yielded。</li>
+</ol>
+
+<h3>4.15 与 <code>query.ts</code> 的关系</h3>
+<p>
+<code>query.ts</code> 根据 feature gate 创建 <code>StreamingToolExecutor</code>。
+模型流中每出现一批完整的 tool_use blocks，就调用 <code>addTool()</code>；
+Streaming 期间还不断调用 <code>getCompletedResults()</code> 提前向 UI / transcript 输出结果。
+模型流结束后再调用 <code>getRemainingResults()</code> 收尾。
+</p>
+
+<pre><code>query.ts
+  │
+  ├── model streaming message
+  │       ↓
+  │   tool_use block
+  │       ↓
+  │   addTool()
+  │       ↓
+  │   Tool 可能已开始执行
+  │
+  ├── getCompletedResults()  ← streaming 中不断拿完成结果
+  │
+  └── response 完成
+          ↓
+      getRemainingResults()
+          ↓
+      等全部 Tool 收尾</code></pre>
+
+<h3>4.16 该脚本在整个系统中的作用</h3>
+<div class="note">
+<strong>系统定位：</strong><code>StreamingToolExecutor.ts</code> 是低延迟 Tool Scheduler。
+它把 Tool Execution 从“模型整轮响应之后的阶段”前移到“模型生成过程中的事件”，
+从而形成 model generation 与 tool execution 的 pipeline overlap。
+</div>
+
+<p class="small">
+源码入口：
+<a href="https://github.com/BennettBin/Claude-code/blob/main/src/services/tools/StreamingToolExecutor.ts">StreamingToolExecutor.ts</a>
+</p>
+</section>
+
+<section class="card" id="cross">
+<h2>5. 四个脚本的完整调用链</h2>
+
+<h3>5.1 非 Streaming 路径</h3>
+<pre><code>query.ts
+  │
+  │ 收集完整 ToolUseBlock[]
+  ▼
+toolOrchestration.ts
+  runTools()
+  │
+  ├── partitionToolCalls()
+  │
+  ├── runToolsConcurrently()
+  │        │
+  │        └── runToolUse()
+  │
+  └── runToolsSerially()
+           │
+           └── runToolUse()
+                    │
+                    ▼
+             toolExecution.ts
+             runToolUse()
+                    │
+                    ▼
+      streamedCheckPermissionsAndCallTool()
+                    │
+                    ▼
+       checkPermissionsAndCallTool()
+          │                    │
+          ▼                    │
+     toolHooks.ts              │
+ runPreToolUseHooks()          │
+          │                    │
+ resolveHookPermissionDecision │
+          │                    │
+          └──────────┬─────────┘
+                     ▼
+                  Tool.call()
+                     │
+          ┌──────────┴──────────┐
+          │                     │
+        success               failure
+          │                     │
+ runPostToolUseHooks()  runPostToolUseFailureHooks()
+          │                     │
+          └──────────┬──────────┘
+                     ▼
+                  messages
+                     │
+                     ▼
+                  query.ts</code></pre>
+
+<h3>5.2 Streaming 路径</h3>
+<pre><code>query.ts model stream
+       │
+       ▼
+完整 tool_use block
+       │
+       ▼
+StreamingToolExecutor.addTool()
+       │
+       ▼
+isConcurrencySafe()
+       │
+       ▼
+processQueue()
+       │
+       ▼
+executeTool()
+       │
+       ▼
+runToolUse() ─────────────────────────────┐
+       │                                  │
+       ▼                                  │
+toolExecution.ts                          │
+       │                                  │
+       ├── PreToolUse Hooks ──→ toolHooks │
+       ├── Permission                      │
+       ├── Tool.call()                     │
+       └── Post/Failure Hooks ─→ toolHooks │
+       │                                  │
+       └──────────────────────────────────┘
+       │
+       ▼
+TrackedTool.results / progress
+       │
+       ├── getCompletedResults()  （模型仍在输出）
+       │
+       └── getRemainingResults()  （模型输出结束）
+       │
+       ▼
+query.ts</code></pre>
+
+<h3>5.3 关键依赖方向</h3>
+<div class="tip">
+依赖方向基本是单向的：
+<strong>Scheduler → Execution Core → Hook Adapter / Tool Implementation</strong>。
+Scheduler 不重复实现 Permission；Hook 层不负责并发；具体 Tool 不负责 Agent Loop。
+这是这套设计可维护性的关键。
+</div>
+</section>
+
+<section class="card" id="comparison">
+<h2>6. 四个脚本的职责边界对比</h2>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>toolExecution</th>
+<th>toolHooks</th>
+<th>toolOrchestration</th>
+<th>StreamingToolExecutor</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>单 Tool 查找</td><td>核心负责</td><td>否</td><td>仅为并发分类查找</td><td>入队时查找</td></tr>
+<tr><td>Schema 校验</td><td>核心负责</td><td>否</td><td>仅分类前做 safeParse</td><td>仅分类前做 safeParse</td></tr>
+<tr><td>Tool-specific validation</td><td>负责</td><td>否</td><td>否</td><td>否，委托 runToolUse</td></tr>
+<tr><td>Pre/Post Hooks</td><td>发起调用</td><td>具体适配</td><td>否</td><td>否，委托 runToolUse</td></tr>
+<tr><td>Permission</td><td>整体 pipeline</td><td>Hook permission merge</td><td>否</td><td>否，委托 runToolUse</td></tr>
+<tr><td>真正 Tool.call()</td><td>负责</td><td>否</td><td>否</td><td>否</td></tr>
+<tr><td>多 Tool 并发</td><td>否</td><td>否</td><td>Batch 并发</td><td>Streaming 并发</td></tr>
+<tr><td>执行顺序/barrier</td><td>单 Tool 无此问题</td><td>否</td><td>按 batch 保序</td><td>状态机 + exclusive barrier</td></tr>
+<tr><td>最大并发上限</td><td>否</td><td>否</td><td>默认 10</td><td>主要受 safe/unsafe 状态约束；此文件本身不是同一套 batch limit</td></tr>
+<tr><td>Progress streaming</td><td>封装统一流</td><td>Hook progress</td><td>向上 yield</td><td>即时缓存/唤醒/yield</td></tr>
+<tr><td>Context Modifier</td><td>产生并返回</td><td>可通过 Hook 注入附加上下文，但不是同一 abstraction</td><td>串行立即应用；并发 batch 后按原顺序应用</td><td>当前只对非-safe Tool 应用</td></tr>
+<tr><td>Sibling cancellation</td><td>接受 AbortController</td><td>感知 cancellation</td><td>无专门 sibling policy</td><td>Bash error 特殊处理</td></tr>
+<tr><td>MCP metadata/auth</td><td>核心负责</td><td>Post Hook 可修改 MCP output</td><td>透明</td><td>透明，最终仍走 runToolUse</td></tr>
+<tr><td>Telemetry / OTel</td><td>最核心</td><td>Hook 相关 telemetry</td><td>较少</td><td>执行状态相关逻辑</td></tr>
+</tbody>
+</table>
+</section>
+
+<section class="card" id="system">
+<h2>7. 这四个脚本在整个 Claude Code Agent Harness 中的位置</h2>
+
+<h3>7.1 从 Agent Runtime 看</h3>
+<pre><code>Agent Runtime / query.ts
+   │
+   │ “模型决定调用哪些工具”
+   ▼
+Tool Runtime
+   │
+   ├── 调度层
+   │     ├── toolOrchestration.ts
+   │     └── StreamingToolExecutor.ts
+   │
+   ├── 单调用执行层
+   │     └── toolExecution.ts
+   │
+   ├── Policy / Extension Layer
+   │     └── toolHooks.ts
+   │
+   └── Tool Abstraction / Concrete Tools
+         ├── BashTool
+         ├── ReadTool
+         ├── EditTool
+         ├── SkillTool
+         ├── MCPTool
+         └── ...</code></pre>
+
+<h3>7.2 它们共同解决的不是“Tool 能做什么”，而是“Tool 如何成为可靠 Runtime 能力”</h3>
+<p>
+一个具体 BashTool 只需要知道如何执行 command；
+但是生产级 Agent Harness 还必须处理：
+</p>
+<ul>
+<li>LLM 参数是否合法。</li>
+<li>Tool 调用是否符合语义约束。</li>
+<li>是否允许用户/策略执行。</li>
+<li>是否能与其他 Tool 并发。</li>
+<li>中断时如何补齐 tool_result。</li>
+<li>进度如何实时显示。</li>
+<li>错误是否应触发 sibling cancellation。</li>
+<li>Tool 输出如何进入下一轮模型上下文。</li>
+<li>MCP Server auth 失败后状态如何更新。</li>
+<li>企业 Hook 如何在执行前后介入。</li>
+<li>如何保证 telemetry 有价值又不过度泄露敏感数据。</li>
+</ul>
+
+<p>
+这四个脚本正是把这些“Tool 能力外围的工程治理”集中到 Runtime 层。
+</p>
+
+<h3>7.3 对自研 Agent Harness 的直接架构启示</h3>
+<pre><code>ToolRuntime
+├── ToolScheduler
+│   ├── BatchScheduler
+│   └── StreamingScheduler
+│
+├── ToolExecutionKernel
+│   ├── SchemaValidator
+│   ├── SemanticValidator
+│   ├── PermissionResolver
+│   ├── Executor
+│   ├── ResultNormalizer
+│   └── ErrorNormalizer
+│
+├── HookPipeline
+│   ├── PreToolUse
+│   ├── PostToolUse
+│   └── PostToolFailure
+│
+├── ContextMutationManager
+├── Abort / Cancellation
+└── Observability</code></pre>
+
+<div class="note">
+<strong>最值得借鉴的设计原则：</strong>
+不要把 Tool Runtime 写成一个单纯的 <code>tool.call()</code> switch。
+真正生产级的 Tool Runtime 应该把“调度”和“单调用执行”拆开，
+再把 Hook/Permission 作为独立 policy layer。
+</div>
+
+<h3>7.4 四个文件可用一句话分别记忆</h3>
+<ul>
+<li><strong><code>toolExecution.ts</code>：</strong>一把 Tool Call 从 LLM JSON 变成可靠 tool_result。</li>
+<li><strong><code>toolHooks.ts</code>：</strong>让外部 Hook/Policy 可以安全地介入这把 Tool Call。</li>
+<li><strong><code>toolOrchestration.ts</code>：</strong>一轮模型已经给出多个 Tool 后，怎么批量保序并发。</li>
+<li><strong><code>StreamingToolExecutor.ts</code>：</strong>模型还没说完时，怎么提前执行 Tool 并维持并发、取消和结果顺序。</li>
+</ul>
+</section>
+
+<section class="card" id="sources">
+<h2>8. 源码入口与建议阅读顺序</h2>
+<p>建议不要按目录顺序读，而按以下顺序：</p>
+<ol>
+<li>
+先读 <a href="https://github.com/BennettBin/Claude-code/blob/main/src/services/tools/toolOrchestration.ts"><code>toolOrchestration.ts</code></a>：
+文件最短，先建立“多个 Tool → runToolUse”的整体图。
+</li>
+<li>
+再读 <a href="https://github.com/BennettBin/Claude-code/blob/main/src/services/tools/toolExecution.ts"><code>toolExecution.ts</code></a>：
+重点追 <code>runToolUse → streamedCheckPermissionsAndCallTool → checkPermissionsAndCallTool → tool.call</code>。
+</li>
+<li>
+遇到 Pre/Post Hook 时跳到
+<a href="https://github.com/BennettBin/Claude-code/blob/main/src/services/tools/toolHooks.ts"><code>toolHooks.ts</code></a>，
+重点看 <code>runPreToolUseHooks()</code> 和 <code>resolveHookPermissionDecision()</code>。
+</li>
+<li>
+最后读
+<a href="https://github.com/BennettBin/Claude-code/blob/main/src/services/tools/StreamingToolExecutor.ts"><code>StreamingToolExecutor.ts</code></a>，
+因为它本质上是在已经理解 <code>runToolUse()</code> 之后增加一个更复杂的 streaming scheduler。
+</li>
+<li>
+再回到
+<a href="https://github.com/BennettBin/Claude-code/blob/main/src/query.ts"><code>query.ts</code></a>
+看两个 scheduler 是如何被 Agent Runtime 选择和消费的。
+</li>
+</ol>
+
+<h3>推荐追踪的函数链</h3>
+<pre><code>query.ts
+  ↓
+runTools() OR StreamingToolExecutor
+  ↓
+runToolUse()
+  ↓
+streamedCheckPermissionsAndCallTool()
+  ↓
+checkPermissionsAndCallTool()
+  ↓
+runPreToolUseHooks()
+  ↓
+resolveHookPermissionDecision()
+  ↓
+tool.call()
+  ↓
+runPostToolUseHooks()
+  ↓
+tool_result</code></pre>
+
+<p class="small">
+仓库目录：
+<a href="https://github.com/BennettBin/Claude-code/tree/main/src/services/tools">src/services/tools</a>
+</p>
+</section>
+
+<div class="footer">
+Claude Code Tool Runtime 源码学习笔记 · 基于 BennettBin/Claude-code 恢复源码
+</div>
+</div>
+</body>
+</html>
